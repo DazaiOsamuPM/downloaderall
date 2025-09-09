@@ -991,7 +991,7 @@ class CacheManager:
                     logger.info(f"Автоочистка кэша: удалено {deleted} старых записей")
                 # Проверяем общий размер кэша
                 cache_size = self.get_cache_size()
-                max_cache_size = 10 * 1024 * 1024 * 1024  # 10 GB
+                max_cache_size = 500 * 1024 * 1024  # 500mb
                 if cache_size > max_cache_size:
                     # Оставляем 8 GB
                     target_size = 8 * 1024 * 1024 * 1024
@@ -1949,3 +1949,4 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
+
