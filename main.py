@@ -42,6 +42,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile
+from aiohttp import web
 
 # ---- config ----
 load_dotenv()
@@ -1912,12 +1913,29 @@ async def on_shutdown():
     logger.info("Shutting down...")
     await bot.session.close()
 
+async def health_check(request):
+    """Endpoint для проверки работоспособности сервиса"""
+    return web.json_response({"status": "ok", "bot": "running"})
+
+async def start_web_server():
+    """Запуск веб-сервера для health check"""
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render использует порт 10000 по умолчанию
+    site = web.TCPSite(runner, '0.0.0.0', 10000)
+    await site.start()
+    logger.info("✅ Веб-сервер для health check запущен на порту 10000")
+
 async def main():
     # Создаем экземпляры менеджеров
     global download_manager, cache_manager, history_manager
     download_manager = DownloadManager(max_concurrent=3)
     cache_manager = CacheManager()
     history_manager = HistoryManager()
+
+    asyncio.create_task(start_web_server())
 
     # Получаем имя бота
     bot_info = await bot.get_me()
@@ -1949,4 +1967,5 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
+
 
