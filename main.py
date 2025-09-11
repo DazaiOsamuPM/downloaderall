@@ -10,7 +10,7 @@
 #   - Улучшенный визуальный прогресс-бар с интерактивом
 #   - Кнопку "Повторить загрузку"
 #   - Историю загрузок
-#   - Автоочистку кэша (теперь всего 6 часов вместо 7 дней)
+#   - Автоочистку кэша
 #   - Фильтрацию сообщений (бот отвечает на команды и ссылки в группах)
 #   - Улучшенная обработка ошибок с рекомендациями
 #   - Поддержка домена m.vkvideo.ru для ВКонтакте
@@ -43,7 +43,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile
-from aiohttp import web
 
 # ---- config ----
 load_dotenv()
@@ -377,6 +376,9 @@ class ErrorManager:
         # ==== НОВОЕ УСЛОВИЕ ДЛЯ ОТСУТСТВИЯ ВИДЕО ====
         elif "no video could be found" in error_msg:
             return DownloadErrorType.NO_VIDEO_IN_POST
+        # ==== НОВОЕ УСЛОВИЕ ДЛЯ ПРЯМЫХ ССЫЛОК ====
+        elif "direct file" in error_msg or "direct link" in error_msg:
+            return DownloadErrorType.DIRECT_FILE_DOWNLOAD
         # ============================================
         else:
             return DownloadErrorType.INTERNAL_ERROR
@@ -1978,19 +1980,9 @@ async def cb_progress_control(callback: types.CallbackQuery):
         if task_id in ACTIVE_DOWNLOADS:
             del ACTIVE_DOWNLOADS[task_id]
 
-# ---- lifecycle ----
-async def on_startup():
-    logger.info("Start polling")
-    # Запускаем задачу для очистки RETRY_LINKS
-    asyncio.create_task(cleanup_retry_links())
-    # Запускаем веб-сервер для health check
-    asyncio.create_task(start_web_server())
-
-async def on_shutdown():
-    logger.info("Shutting down...")
-    await bot.session.close()
-
 # ===== ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK =====
+from aiohttp import web
+
 async def health_check(request):
     """Endpoint для проверки работоспособности сервиса"""
     return web.json_response({"status": "ok", "bot": "running"})
@@ -2006,14 +1998,24 @@ async def start_web_server():
     await site.start()
     logger.info("✅ Веб-сервер для health check запущен на порту 10000")
 
+# ---- lifecycle ----
+async def on_startup():
+    logger.info("Start polling")
+    # Запускаем задачу для очистки RETRY_LINKS
+    asyncio.create_task(cleanup_retry_links())
+    # Запускаем веб-сервер для health check
+    asyncio.create_task(start_web_server())
+
+async def on_shutdown():
+    logger.info("Shutting down...")
+    await bot.session.close()
+
 async def main():
     # Создаем экземпляры менеджеров
     global download_manager, cache_manager, history_manager
     download_manager = DownloadManager(max_concurrent=3)
     cache_manager = CacheManager()
     history_manager = HistoryManager()
-
-    asyncio.create_task(start_web_server())
 
     # Получаем имя бота
     bot_info = await bot.get_me()
@@ -2044,5 +2046,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
