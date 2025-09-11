@@ -10,12 +10,13 @@
 #   - Улучшенный визуальный прогресс-бар с интерактивом
 #   - Кнопку "Повторить загрузку"
 #   - Историю загрузок
-#   - Автоочистку кэша
+#   - Автоочистку кэша (теперь всего 6 часов вместо 7 дней)
 #   - Фильтрацию сообщений (бот отвечает на команды и ссылки в группах)
 #   - Улучшенная обработка ошибок с рекомендациями
-#   - Валидация cookies-файла
-#   - Проверка свободного места на диске
-#   - Нормализация URL для Reddit и Pinterest (pin.it)
+#   - Поддержка домена m.vkvideo.ru для ВКонтакте
+#   - Поддержка прямых ссылок на файлы (mp4, mp3 и др.)
+#   - Защита от загрузки слишком больших файлов (лимит 1 ГБ)
+#   - Уведомление о долгой загрузке
 # ===========================================
 from __future__ import annotations
 import os
@@ -42,7 +43,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile
-from aiohttp import web
 
 # ---- config ----
 load_dotenv()
@@ -77,8 +77,8 @@ FACEBOOK_RE = re.compile(r"(?:www\.facebook\.com/.+/videos/|www\.facebook\.com/v
 # регулярные выражения для Twitter/X
 TWITTER_RE = re.compile(r"(?:twitter\.com|x\.com)/[^/]+/status/\d+", re.IGNORECASE)
 
-# регулярные выражения для VK
-VK_RE = re.compile(r"(?:vk\.com/video-?\d+_\d+|vk\.com/clip-?\d+_\d+|vk\.com/wall-?\d+_\d+)", re.IGNORECASE)
+# регулярные выражения для VK (обновлено!)
+VK_RE = re.compile(r"(?:vk\.com/video-?\d+_\d+|vk\.com/clip-?\d+_\d+|vk\.com/wall-?\d+_\d+|m\.vkvideo\.ru/[\w/]+)", re.IGNORECASE)
 
 # регулярные выражения для Reddit
 REDDIT_RE = re.compile(r"reddit\.com/(?:r/[^/]+/comments/|comments/)[\w]+/[\w_-]+/[\w]+", re.IGNORECASE)
@@ -95,11 +95,14 @@ VIMEO_RE = re.compile(r"vimeo\.com/(?:\d+|album/\d+/video/\d+)", re.IGNORECASE)
 # регулярные выражения для SoundCloud
 SOUNDCLOUD_RE = re.compile(r"soundcloud\.com/[^/]+/[^/]+", re.IGNORECASE)
 
+# регулярные выражения для прямых ссылок на файлы
+DIRECT_FILE_RE = re.compile(r".*\.(?:mp4|mkv|webm|avi|mov|wmv|flv|mp3|m4a|wav|aac|ogg)$", re.IGNORECASE)
+
 # короткие/редирект домены (добавлен pin.it)
 SHORTENER_DOMAINS = (
     "t.co", "t.me", "bit.ly", "tinyurl.com", "lnkd.in", "goo.gl", "rb.gy",
     "vm.tiktok.com", "m.tiktok.com", "www.tiktok.com", "tiktok.com",
-    "x.com", "twitter.com", "vk.com", "reddit.com", "pinterest.com", "pin.it",
+    "x.com", "twitter.com", "vk.com", "m.vkvideo.ru", "reddit.com", "pinterest.com", "pin.it",
     "dailymotion.com", "vimeo.com", "soundcloud.com"
 )
 
@@ -123,6 +126,7 @@ class DownloadErrorType:
     RATE_LIMITED = "rate_limited"
     URL_NOT_FOUND = "url_not_found"
     NO_VIDEO_IN_POST = "no_video_in_post"  # <-- НОВЫЙ ТИП ОШИБКИ
+    DIRECT_FILE_DOWNLOAD = "direct_file_download"  # <-- НОВЫЙ ТИП ОШИБКИ
 
 class ErrorManager:
     def __init__(self, default_lang="ru"):
@@ -229,6 +233,12 @@ class ErrorManager:
                         "• Ссылка на внешний ресурс"
                     ],
                     "additional": "Попробуйте найти другой пост или пин с видео."
+                },
+                # ==== НОВОЕ СООБЩЕНИЕ ОБ ОШИБКЕ ДЛЯ ПРЯМЫХ ССЫЛОК ====
+                DownloadErrorType.DIRECT_FILE_DOWNLOAD: {
+                    "title": "📥 Прямая загрузка файла",
+                    "description": "Я обнаружил прямую ссылку на файл. Начинаю загрузку:",
+                    "additional": "Это может занять некоторое время в зависимости от размера файла и скорости сети."
                 }
                 # ===================================
             },
@@ -333,6 +343,12 @@ class ErrorManager:
                         "• Link to external resource"
                     ],
                     "additional": "Try finding another post or pin with video content."
+                },
+                # ==== НОВОЕ СООБЩЕНИЕ ОБ ОШИБКЕ ДЛЯ ПРЯМЫХ ССЫЛОК (EN) ====
+                DownloadErrorType.DIRECT_FILE_DOWNLOAD: {
+                    "title": "📥 Direct file download",
+                    "description": "I detected a direct link to a file. Starting download:",
+                    "additional": "This may take some time depending on file size and network speed."
                 }
                 # =======================================
             }
@@ -403,7 +419,7 @@ class GroupFilter(BaseFilter):
         self.supported_domains = [
             "tiktok.com", "vm.tiktok.com", "m.tiktok.com",
             "youtube.com", "youtu.be", "instagram.com", "facebook.com",
-            "twitter.com", "x.com", "vk.com", "reddit.com", "pinterest.com", "pin.it",
+            "twitter.com", "x.com", "vk.com", "m.vkvideo.ru", "reddit.com", "pinterest.com", "pin.it",
             "dailymotion.com", "vimeo.com", "soundcloud.com"
         ]
 
@@ -609,18 +625,47 @@ class DownloadManager:
                 await callback_query.message.answer("⚠️ На сервере недостаточно места для загрузки. Попробуйте позже.")
                 return
 
+            # Проверяем, не слишком ли большой файл (ограничение 1 ГБ)
             try:
-                func = partial(ytdl_download, url, tempdir, mode, progress_hook, user_id)
-                filepath = await asyncio.wait_for(loop.run_in_executor(None, func), timeout=420)
-
-                # Сохраняем в кэш
-                cache_manager.add_to_cache(url, filepath, mode)
-                # Добавляем в историю
-                history_manager.add_to_history(user_id, url, mode)
-                # Отправляем файл
-                await self._send_file(callback_query, url, filepath, mode, status_msg.message_id)
+                head = requests.head(url, timeout=10)
+                if 'content-length' in head.headers:
+                    content_length = int(head.headers['content-length'])
+                    if content_length > 1024 * 1024 * 1024:  # 1 ГБ
+                        await bot.edit_message_text(
+                            chat_id=target_chat_id,
+                            message_id=status_msg.message_id,
+                            text=f"❌ Файл слишком большой ({content_length/(1024*1024):.1f} MB). "
+                                 f"Максимальный размер: 1 ГБ."
+                        )
+                        return
             except Exception as e:
-                await self._handle_download_error(callback_query, e, url, status_msg.message_id)
+                logger.warning(f"Не удалось определить размер файла: {e}")
+
+            # Если это прямая ссылка на файл, используем упрощенную загрузку
+            if DIRECT_FILE_RE.search(url):
+                try:
+                    await bot.edit_message_text(
+                        chat_id=target_chat_id,
+                        message_id=status_msg.message_id,
+                        text="📥 Обнаружена прямая ссылка на файл. Начинаю загрузку..."
+                    )
+                    filepath = await self._download_direct_file(url, tempdir)
+                except Exception as e:
+                    await self._handle_download_error(callback_query, e, url, status_msg.message_id)
+                    return
+            else:
+                try:
+                    func = partial(ytdl_download, url, tempdir, mode, progress_hook, user_id)
+                    filepath = await asyncio.wait_for(loop.run_in_executor(None, func), timeout=420)
+
+                    # Сохраняем в кэш
+                    cache_manager.add_to_cache(url, filepath, mode)
+                    # Добавляем в историю
+                    history_manager.add_to_history(user_id, url, mode)
+                    # Отправляем файл
+                    await self._send_file(callback_query, url, filepath, mode, status_msg.message_id)
+                except Exception as e:
+                    await self._handle_download_error(callback_query, e, url, status_msg.message_id)
             finally:
                 try:
                     if tempdir and os.path.isdir(tempdir):
@@ -645,6 +690,23 @@ class DownloadManager:
                 # Удаляем информацию о загрузке
                 if task_id in ACTIVE_DOWNLOADS:
                     del ACTIVE_DOWNLOADS[task_id]
+
+    async def _download_direct_file(self, url: str, tempdir: str) -> str:
+        """Скачивание прямой ссылки на файл"""
+        filename = os.path.basename(urlparse(url).path) or "downloaded_file"
+        if not any(filename.endswith(ext) for ext in [".mp4", ".mp3", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4a", ".wav", ".aac", ".ogg"]):
+            filename += ".mp4"  # Добавляем расширение по умолчанию
+        
+        filepath = os.path.join(tempdir, filename)
+        
+        # Скачиваем файл
+        with requests.get(url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            with open(filepath, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        
+        return filepath
 
     async def add_download(self, callback_query: types.CallbackQuery, url: str, mode: str):
         """Добавить загрузку в очередь"""
@@ -711,7 +773,7 @@ class DownloadManager:
                 source = "Facebook"
             elif "twitter.com" in url_low or "x.com" in url_low:
                 source = "Twitter/X"
-            elif "vk.com" in url_low:
+            elif "vk.com" in url_low or "m.vkvideo.ru" in url_low:
                 source = "VK"
             elif "reddit.com" in url_low:
                 source = "Reddit"
@@ -723,6 +785,8 @@ class DownloadManager:
                 source = "Vimeo"
             elif "soundcloud.com" in url_low:
                 source = "SoundCloud"
+            elif DIRECT_FILE_RE.search(url):
+                source = "Прямая ссылка"
 
             if size_mb > 48:
                 await bot.edit_message_text(
@@ -910,9 +974,9 @@ class CacheManager:
         finally:
             conn.close()
 
-    def cleanup_old_files(self, days=7) -> int:
-        """Удаление файлов старше указанного количества дней"""
-        cutoff = datetime.now() - timedelta(days=days)
+    def cleanup_old_files_by_hours(self, hours=6) -> int:
+        """Удаление файлов старше указанного количества часов (было дней)"""
+        cutoff = datetime.now() - timedelta(hours=hours)
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM cache WHERE timestamp < ?", (cutoff,))
@@ -986,13 +1050,13 @@ class CacheManager:
         """Фоновая задача для регулярной очистки кэша"""
         while True:
             try:
-                # Очищаем файлы старше 7 дней
-                deleted = self.cleanup_old_files(days=7)
+                # Очищаем файлы старше 6 часов (было 7 дней)
+                deleted = self.cleanup_old_files_by_hours(hours=6)
                 if deleted > 0:
                     logger.info(f"Автоочистка кэша: удалено {deleted} старых записей")
                 # Проверяем общий размер кэша
                 cache_size = self.get_cache_size()
-                max_cache_size = 500 * 1024 * 1024  # 500mb
+                max_cache_size = 10 * 1024 * 1024 * 1024  # 10 GB
                 if cache_size > max_cache_size:
                     # Оставляем 8 GB
                     target_size = 8 * 1024 * 1024 * 1024
@@ -1384,7 +1448,7 @@ def is_supported_by_platform(url: str) -> bool:
         return bool(FACEBOOK_RE.search(u))
     if "twitter.com" in u or "x.com" in u:
         return bool(TWITTER_RE.search(u))
-    if "vk.com" in u:
+    if "vk.com" in u or "m.vkvideo.ru" in u:
         return bool(VK_RE.search(u))
     if "reddit.com" in u:
         return bool(REDDIT_RE.search(u))
@@ -1396,6 +1460,9 @@ def is_supported_by_platform(url: str) -> bool:
         return bool(VIMEO_RE.search(u))
     if "soundcloud.com" in u:
         return bool(SOUNDCLOUD_RE.search(u))
+    # Проверяем прямые ссылки на файлы
+    if DIRECT_FILE_RE.search(url):
+        return True
     return False
 
 def make_actions_kb(pending_msg_id: int) -> InlineKeyboardMarkup:
@@ -1556,7 +1623,7 @@ async def cmd_start(message: types.Message):
     ])
     await message.reply(
         "Привет! 👋\n"
-        "Я могу скачать для тебя видео или аудио с YouTube, TikTok, Instagram, Facebook, Twitter/X, VK, Reddit, Pinterest, Dailymotion, Vimeo и SoundCloud.\n"
+        "Я могу скачать для тебя видео или аудио с YouTube, TikTok, Instagram, Facebook, Twitter/X, VK, Reddit, Pinterest, Dailymotion, Vimeo, SoundCloud и прямых ссылок.\n"
         "👤 Автор: @frastiel",
         reply_markup=keyboard
     )
@@ -1671,6 +1738,12 @@ async def handle_text(message: types.Message):
                 normalized = clean
         except Exception:
             logger.exception("Normalization failed for %s", url)
+    elif DIRECT_FILE_RE.search(url):
+        # Если это прямая ссылка на файл, показываем уведомление
+        await message.answer(
+            "📥 Обнаружена прямая ссылка на файл. Начинаю загрузку...\n"
+            "Это может занять некоторое время в зависимости от размера файла."
+        )
 
     if not is_supported_by_platform(normalized):
         # В личном чате сообщаем об ошибке
@@ -1678,6 +1751,7 @@ async def handle_text(message: types.Message):
             await message.reply(
                 "Поддерживаются только прямые ссылки на видео с поддерживаемых платформ.\n"
                 "Платформы: YouTube, TikTok, Instagram, Facebook, Twitter/X, VK, Reddit, Pinterest, Dailymotion, Vimeo, SoundCloud.\n"
+                "Также поддерживаются прямые ссылки на файлы (mp4, mp3 и др.).\n"
                 "Если прислали профиль/хештег/страницу — отправьте прямую ссылку на видео."
             )
         return
@@ -1903,15 +1977,8 @@ async def cb_progress_control(callback: types.CallbackQuery):
         if task_id in ACTIVE_DOWNLOADS:
             del ACTIVE_DOWNLOADS[task_id]
 
-# ---- lifecycle ----
-async def on_startup():
-    logger.info("Start polling")
-    # Запускаем задачу для очистки RETRY_LINKS
-    asyncio.create_task(cleanup_retry_links())
-
-async def on_shutdown():
-    logger.info("Shutting down...")
-    await bot.session.close()
+# ===== ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK =====
+from aiohttp import web
 
 async def health_check(request):
     """Endpoint для проверки работоспособности сервиса"""
@@ -1928,14 +1995,24 @@ async def start_web_server():
     await site.start()
     logger.info("✅ Веб-сервер для health check запущен на порту 10000")
 
+# ---- lifecycle ----
+async def on_startup():
+    logger.info("Start polling")
+    # Запускаем задачу для очистки RETRY_LINKS
+    asyncio.create_task(cleanup_retry_links())
+    # Запускаем веб-сервер для health check
+    asyncio.create_task(start_web_server())
+
+async def on_shutdown():
+    logger.info("Shutting down...")
+    await bot.session.close()
+
 async def main():
     # Создаем экземпляры менеджеров
     global download_manager, cache_manager, history_manager
     download_manager = DownloadManager(max_concurrent=3)
     cache_manager = CacheManager()
     history_manager = HistoryManager()
-
-    asyncio.create_task(start_web_server())
 
     # Получаем имя бота
     bot_info = await bot.get_me()
@@ -1965,7 +2042,4 @@ async def main():
         await bot.session.close()
 
 if __name__ == "__main__":
-
     asyncio.run(main())
-
-
