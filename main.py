@@ -43,6 +43,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile
+from aiohttp import web
 
 # ---- config ----
 load_dotenv()
@@ -2043,3 +2044,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
