@@ -360,7 +360,7 @@ class ErrorManager:
         else:
             return DownloadErrorType.INTERNAL_ERROR
 
-    def format_error_message(self, error_type: DownloadErrorType, lang: str = None) -> str:
+    def format_error_message(self, error_type: DownloadErrorType, lang: str = None, url: str = None) -> str:
         """Форматирует сообщение об ошибке с использованием шаблона"""
         if lang is None or lang not in self.error_messages:
             lang = self.default_lang
@@ -2143,3 +2143,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
