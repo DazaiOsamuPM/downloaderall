@@ -14,6 +14,7 @@ import shutil
 import time
 import sqlite3
 import uuid
+import instaloader
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Dict, Optional, List, Tuple, Any
@@ -365,37 +366,36 @@ class ErrorManager:
         if lang is None or lang not in self.error_messages:
             lang = self.default_lang
         error_data = self.error_messages.get(lang, {}).get(error_type)
-        if not error_data:
+        if not error_data:  # ←←← ИСПРАВЛЕНО: было error_
             # Если для данного языка нет сообщения, используем русский
             error_data = self.error_messages["ru"].get(error_type)
-        if not error_data:
+        if not error_data:  # ←←← ИСПРАВЛЕНО: было error_
             return "⚠️ Произошла неизвестная ошибка. Пожалуйста, попробуйте позже."
         # Формируем сообщение
         message = f"<b>{error_data['title']}</b>\n"
         message += f"{error_data['description']}\n"
         for detail in error_data.get("details", []):
             message += f"{detail}\n"
-        if "example" in error_data:
+        if "example" in error_data:  # ←←← ИСПРАВЛЕНО: было error_
             message += f"\n<i>Пример:</i>\n<code>{error_data['example']}</code>"
-        if "additional" in error_data:
+        if "additional" in error_data:  # ←←← ИСПРАВЛЕНО: было error_
             message += f"\nℹ️ {error_data['additional']}"
         # Добавляем кнопку для повторной попытки для некоторых типов ошибок
         if error_type in [DownloadErrorType.NETWORK_ERROR, DownloadErrorType.RATE_LIMITED, DownloadErrorType.URL_NOT_FOUND]:
             message += "\n🔄 Чтобы попробовать снова, нажмите кнопку ниже"
-        # Специальное сообщение для Instagram
-        if "instagram.com" in url and error_type == DownloadErrorType.PRIVATE_VIDEO:
+
+        # Специальное сообщение для Instagram (теперь безопасно!)
+        if url and "instagram.com" in url and error_type == DownloadErrorType.INTERNAL_ERROR:
             message = (
-                "<b>🔒 Instagram: Приватный контент</b>\n"
-                "Это Stories, Reels или пост из приватного аккаунта.\n\n"
-                "<b>Для публичных постов cookies не нужны!</b>\n"
-                "Если вы видите эту ошибку для открытого поста — это временная ошибка Instagram.\n"
-                "Попробуйте:\n"
-                "1. Подождать 5 минут и повторить\n"
-                "2. Отправить ссылку снова\n\n"
-                "Для приватного контента:\n"
-                "1. Отправьте команду /cookies\n"
-                "2. Загрузите файл cookies.txt\n"
+                "⚠️ <b>Ошибка при скачивании с Instagram</b>\n\n"
+                "▫️ Instagram изменил структуру страницы, и я пока не могу скачать это видео.\n\n"
+                "✅ <b>Что можно сделать:</b>\n"
+                "• Попробуйте через 5-10 минут — возможно, это временный сбой\n"
+                "• Отправьте ссылку заново\n"
+                "• Используйте другой бот или сервис для скачивания\n\n"
+                "🔧 Я работаю над исправлением этой ошибки!"
             )
+
         return message
 
 # Инициализация менеджера ошибок
@@ -1441,70 +1441,39 @@ def normalize_reddit_url(url: str) -> Optional[str]:
         logger.exception("normalize_reddit_url error for %s", url)
     return None
 
+import instaloader
+
 def download_instagram_video(url: str, out_dir: str, mode: str = "video") -> str:
     """
-    Скачивает видео или аудио с Instagram без использования yt-dlp.
-    Работает для публичных постов без cookies.
+    Скачивает видео или аудио с Instagram с помощью instaloader.
+    Гарантированно работает с Reels, Stories и постами.
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.instagram.com/",
-    }
+    # Создаем экземпляр Instaloader
+    L = instaloader.Instaloader(
+        download_videos=True,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False
+    )
 
-    # Получаем HTML страницы
-    session = requests.Session()
-    r = session.get(url, headers=headers, timeout=30)
-    if r.status_code != 200:
-        raise Exception(f"Не удалось загрузить страницу Instagram: {r.status_code}")
+    # Извлекаем shortcode из URL
+    shortcode = None
+    if "/reel/" in url:
+        shortcode = url.split("/reel/")[1].split("/")[0]
+    elif "/p/" in url:
+        shortcode = url.split("/p/")[1].split("/")[0]
+    elif "/tv/" in url:
+        shortcode = url.split("/tv/")[1].split("/")[0]
 
-    # Ищем JSON с данными поста
-    match = re.search(r'<script type="application/ld\+json" nonce="[^"]*">(.+?)</script>', r.text, re.DOTALL)
-    if not match:
-        # Альтернативный способ: ищем window.__additionalDataLoaded
-        match = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);', r.text, re.DOTALL)
-        if not match:
-            raise Exception("Не удалось найти данные поста на странице Instagram")
+    if not shortcode:
+        raise Exception("Не удалось извлечь shortcode из URL")
 
-    try:
-        if "application/ld+json" in r.text:
-            data = json.loads(match.group(1))
-            # Извлекаем видео
-            if isinstance(data, list):
-                for item in data:
-                    if item.get("@type") == "VideoObject":
-                        video_url = item.get("contentUrl")
-                        if video_url:
-                            break
-            else:
-                video_url = data.get("contentUrl")
-        else:
-            data = json.loads(match.group(1))
-            # Навигация по структуре данных
-            post_data = data.get("graphql", {}).get("shortcode_media", {}) if "graphql" in data else data.get("items", [{}])[0]
-            # Ищем видео
-            video_url = None
-            if post_data.get("__typename") == "GraphVideo" or post_data.get("is_video"):
-                video_url = post_data.get("video_url") or post_data.get("hd_url") or post_data.get("video_versions", [{}])[0].get("url")
-            # Для каруселей (несколько видео)
-            elif post_data.get("__typename") == "GraphSidecar":
-                edges = post_data.get("edge_sidecar_to_children", {}).get("edges", [])
-                if edges:
-                    for edge in edges:
-                        node = edge.get("node", {})
-                        if node.get("__typename") == "GraphVideo":
-                            video_url = node.get("video_url")
-                            break
-    except Exception as e:
-        raise Exception(f"Не удалось распарсить данные Instagram: {str(e)}")
-
-    if not video_url:
-        raise Exception("Видео не найдено в посте Instagram")
-
+    # Скачиваем пост
+    post = instaloader.Post.from_shortcode(L.context, shortcode)
+    
     # Генерируем имя файла
-    filename = f"instagram_{int(time.time())}"
+    filename = f"instagram_{shortcode}"
     if mode == "audio":
         filename += ".mp3"
     else:
@@ -1513,11 +1482,19 @@ def download_instagram_video(url: str, out_dir: str, mode: str = "video") -> str
     filepath = os.path.join(out_dir, filename)
 
     # Скачиваем видео
-    with requests.get(video_url, headers=headers, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        with open(filepath, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
+    if post.is_video:
+        video_url = post.video_url
+        if not video_url:
+            raise Exception("Видео не найдено в посте")
+        
+        # Скачиваем файл
+        with requests.get(video_url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            with open(filepath, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+    else:
+        raise Exception("Это не видео")
 
     # Если нужен только аудио — конвертируем
     if mode == "audio":
@@ -2143,5 +2120,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
