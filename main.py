@@ -863,7 +863,7 @@ class DownloadManager:
 
         # Формируем сообщение
         lang = user_settings.get_settings(user_id)["language"]
-        error_message = error_manager.format_error_message(error_type, lang)
+        error_message = error_manager.format_error_message(error_type, lang, url)
 
         # Создаем клавиатуру с действиями
         action_kb = None
@@ -2143,4 +2143,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
