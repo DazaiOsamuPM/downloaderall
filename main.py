@@ -646,12 +646,12 @@ class DownloadManager:
                     await self._send_file(callback_query, url, filepath, mode, status_msg.message_id)
                 except Exception as e:
                     await self._handle_download_error(callback_query, e, url, status_msg.message_id)
-            finally:
-                try:
-                    if tempdir and os.path.isdir(tempdir):
-                        shutil.rmtree(tempdir)
-                except Exception:
-                    pass
+                finally:
+                    try:
+                        if tempdir and os.path.isdir(tempdir):
+                            shutil.rmtree(tempdir)
+                    except Exception:
+                        pass
         except Exception as e:
             logger.exception("Ошибка при обработке загрузки")
             try:
