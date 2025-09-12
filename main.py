@@ -382,6 +382,20 @@ class ErrorManager:
         # Добавляем кнопку для повторной попытки для некоторых типов ошибок
         if error_type in [DownloadErrorType.NETWORK_ERROR, DownloadErrorType.RATE_LIMITED, DownloadErrorType.URL_NOT_FOUND]:
             message += "\n🔄 Чтобы попробовать снова, нажмите кнопку ниже"
+        # Специальное сообщение для Instagram
+        if "instagram.com" in url and error_type == DownloadErrorType.PRIVATE_VIDEO:
+            message = (
+                "<b>🔒 Instagram: Приватный контент</b>\n"
+                "Это Stories, Reels или пост из приватного аккаунта.\n\n"
+                "<b>Для публичных постов cookies не нужны!</b>\n"
+                "Если вы видите эту ошибку для открытого поста — это временная ошибка Instagram.\n"
+                "Попробуйте:\n"
+                "1. Подождать 5 минут и повторить\n"
+                "2. Отправить ссылку снова\n\n"
+                "Для приватного контента:\n"
+                "1. Отправьте команду /cookies\n"
+                "2. Загрузите файл cookies.txt\n"
+            )
         return message
 
 # Инициализация менеджера ошибок
@@ -635,8 +649,18 @@ class DownloadManager:
                     return
             else:
                 try:
-                    func = partial(ytdl_download, url, tempdir, mode, progress_hook, user_id)
-                    filepath = await asyncio.wait_for(loop.run_in_executor(None, func), timeout=420)
+                    # Специальная обработка для Instagram
+                    if "instagram.com" in url.lower():
+                        await bot.edit_message_text(
+                            chat_id=target_chat_id,
+                            message_id=status_msg.message_id,
+                            text="📥 Скачиваю видео с Instagram..."
+                        )
+                        filepath = await asyncio.to_thread(download_instagram_video, url, tempdir, mode)
+                    else:
+                        # Используем yt-dlp для всех остальных платформ
+                        func = partial(ytdl_download, url, tempdir, mode, progress_hook, user_id)
+                        filepath = await asyncio.wait_for(loop.run_in_executor(None, func), timeout=420)
 
                     # Сохраняем в кэш
                     cache_manager.add_to_cache(url, filepath, mode)
@@ -645,7 +669,11 @@ class DownloadManager:
                     # Отправляем файл
                     await self._send_file(callback_query, url, filepath, mode, status_msg.message_id)
                 except Exception as e:
-                    await self._handle_download_error(callback_query, e, url, status_msg.message_id)
+                    # Если ошибка связана с приватным видео на Instagram, показываем другое сообщение
+                    if "instagram.com" in url.lower() and "private" in str(e).lower():
+                        await self._handle_download_error(callback_query, DownloadError("Это приватный аккаунт или Stories. Для скачивания нужен файл cookies."), url, status_msg.message_id)
+                    else:
+                        await self._handle_download_error(callback_query, e, url, status_msg.message_id)
                 finally:
                     try:
                         if tempdir and os.path.isdir(tempdir):
@@ -1412,6 +1440,100 @@ def normalize_reddit_url(url: str) -> Optional[str]:
     except Exception:
         logger.exception("normalize_reddit_url error for %s", url)
     return None
+
+def download_instagram_video(url: str, out_dir: str, mode: str = "video") -> str:
+    """
+    Скачивает видео или аудио с Instagram без использования yt-dlp.
+    Работает для публичных постов без cookies.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.instagram.com/",
+    }
+
+    # Получаем HTML страницы
+    session = requests.Session()
+    r = session.get(url, headers=headers, timeout=30)
+    if r.status_code != 200:
+        raise Exception(f"Не удалось загрузить страницу Instagram: {r.status_code}")
+
+    # Ищем JSON с данными поста
+    match = re.search(r'<script type="application/ld\+json" nonce="[^"]*">(.+?)</script>', r.text, re.DOTALL)
+    if not match:
+        # Альтернативный способ: ищем window.__additionalDataLoaded
+        match = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);', r.text, re.DOTALL)
+        if not match:
+            raise Exception("Не удалось найти данные поста на странице Instagram")
+
+    try:
+        if "application/ld+json" in r.text:
+            data = json.loads(match.group(1))
+            # Извлекаем видео
+            if isinstance(data, list):
+                for item in data:
+                    if item.get("@type") == "VideoObject":
+                        video_url = item.get("contentUrl")
+                        if video_url:
+                            break
+            else:
+                video_url = data.get("contentUrl")
+        else:
+            data = json.loads(match.group(1))
+            # Навигация по структуре данных
+            post_data = data.get("graphql", {}).get("shortcode_media", {}) if "graphql" in data else data.get("items", [{}])[0]
+            # Ищем видео
+            video_url = None
+            if post_data.get("__typename") == "GraphVideo" or post_data.get("is_video"):
+                video_url = post_data.get("video_url") or post_data.get("hd_url") or post_data.get("video_versions", [{}])[0].get("url")
+            # Для каруселей (несколько видео)
+            elif post_data.get("__typename") == "GraphSidecar":
+                edges = post_data.get("edge_sidecar_to_children", {}).get("edges", [])
+                if edges:
+                    for edge in edges:
+                        node = edge.get("node", {})
+                        if node.get("__typename") == "GraphVideo":
+                            video_url = node.get("video_url")
+                            break
+    except Exception as e:
+        raise Exception(f"Не удалось распарсить данные Instagram: {str(e)}")
+
+    if not video_url:
+        raise Exception("Видео не найдено в посте Instagram")
+
+    # Генерируем имя файла
+    filename = f"instagram_{int(time.time())}"
+    if mode == "audio":
+        filename += ".mp3"
+    else:
+        filename += ".mp4"
+
+    filepath = os.path.join(out_dir, filename)
+
+    # Скачиваем видео
+    with requests.get(video_url, headers=headers, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(filepath, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+    # Если нужен только аудио — конвертируем
+    if mode == "audio":
+        try:
+            import subprocess
+            audio_filepath = filepath.replace(".mp4", ".mp3")
+            subprocess.run([
+                "ffmpeg", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_filepath
+            ], check=True, capture_output=True)
+            # Удаляем оригинальный видеофайл
+            os.remove(filepath)
+            filepath = audio_filepath
+        except Exception as e:
+            logger.warning(f"Не удалось извлечь аудио: {e}. Оставляем видео.")
+
+    return filepath
 
 def is_youtube_video(url: str) -> bool:
     return bool(YOUTUBE_VIDEO_RE.search(url or ""))
