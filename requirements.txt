@@ -3,3 +3,4 @@ aiohttp==3.9.5
 python-dotenv==1.0.1
 yt-dlp==2024.7.9
 requests==2.32.3
+instaloader==4.10.2
