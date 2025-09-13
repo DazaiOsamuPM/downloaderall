@@ -344,10 +344,10 @@ class ErrorManager:
         if lang is None or lang not in self.error_messages:
             lang = self.default_lang
         error_data = self.error_messages.get(lang, {}).get(error_type)
-        if not error_
+        if not error_data
             # Если для данного языка нет сообщения, используем русский
             error_data = self.error_messages["ru"].get(error_type)
-        if not error_
+        if not error_data
             return "⚠️ Произошла неизвестная ошибка. Пожалуйста, попробуйте позже."
         # Формируем сообщение
         message = f"<b>{error_data['title']}</b>\n"
@@ -2160,3 +2160,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
