@@ -2066,6 +2066,9 @@ def has_enough_disk_space(path: str, required_mb: int = 500) -> bool:
 async def handle_text(message: types.Message):
     text = (message.text or "").strip()
     url = find_first_url(text)
+    # Ignore admin command /addnews so it won't be treated as a download request
+    if text.startswith("/addnews") or text.startswith(" /addnews"):
+        return
     # Если ссылка не найдена, но это личный чат - сообщаем об ошибке
     if not url:
         if message.chat.type == "private":
