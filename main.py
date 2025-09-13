@@ -2,10 +2,19 @@
 #  Video Downloader Bot (VIP Version) - ПРОФЕССИОНАЛЬНАЯ ВЕРСИЯ
 #  Автор: @frastiel (Telegram)
 #  Aiogram v3, Python 3.11
+#  Включает:
+#   - Асинхронную загрузку (несколько загрузок одновременно)
+#   - Кэширование (экономия времени и трафика)
+#   - Поддержку Instagram, Facebook, Twitter/X, VK, Reddit, Pinterest, Dailymotion, Vimeo, SoundCloud
+#   - Улучшенный визуальный прогресс-бар с интерактивом
+#   - Кнопку "Повторить загрузку"
+#   - Историю загрузок
+#   - Автоочистку кэша
+#   - Фильтрацию сообщений (бот отвечает на команды и ссылки в группах)
+#   - Улучшенная обработка ошибок с рекомендациями
 # ===========================================
 from __future__ import annotations
 import os
-from typing import Optional
 import re
 import json
 import asyncio
@@ -15,10 +24,9 @@ import shutil
 import time
 import sqlite3
 import uuid
-import instaloader
 from datetime import datetime, timedelta
 from functools import partial
-from typing import Dict, Optional, List, Tuple, Any, Optional
+from typing import Dict, Optional, List, Tuple, Any
 from urllib.parse import urlparse, urlunparse
 import requests
 from dotenv import load_dotenv
@@ -30,7 +38,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile
-from aiohttp import web
 
 # ---- config ----
 load_dotenv()
@@ -49,86 +56,81 @@ dp = Dispatcher()
 PENDING_LINKS: Dict[int, str] = {}
 ACTIVE_DOWNLOADS: Dict[int, Dict[str, Any]] = {}  # Хранит информацию о текущих загрузках
 
-# Улучшенный паттерн для поиска URL в тексте
-# Более точный, исключает лишние символы в конце
+# ---- regex ----
 URL_RE = re.compile(r"https?://[^\s<>'\"()\[\]{}]+", re.IGNORECASE)
 
-# ===== УЛУЧШЕННЫЕ РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ ДЛЯ ПЛАТФОРМ =====
-
-# TikTok - улучшенная поддержка всех форматов
+# расширенный набор паттернов для TikTok
 TIKTOK_ANY_RE = re.compile(
     r"(?:https?://)?(?:vm\.tiktok\.com|vt\.tiktok\.com|m\.tiktok\.com|www\.tiktok\.com|tiktok\.com)"
     r"/(?:@[\w\.]+/video/\d+|video/\d+|v/\d+|t/\w+|share/\w+|embed/\d+|tag/[^/]+|hashtag/[^/]+|music/\d+|@[\w\.]+)",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
-# Instagram - добавлена поддержка stories и IGTV
+# регулярные выражения для Instagram и Facebook
 INSTAGRAM_RE = re.compile(
     r"(?:https?://)?(?:www\.)?instagram\.com/"
     r"(?:p/[^/]+|reel/[^/]+|tv/[^/]+|stories/[^/]+/[^/]+)",
     re.IGNORECASE
 )
-
-# Facebook - улучшенная поддержка разных форматов
 FACEBOOK_RE = re.compile(
     r"(?:https?://)?(?:www\.)?facebook\.com/"
     r"(?:[^/]+/videos/\d+|video\.php\?v=\d+|watch/\?v=\d+)",
     re.IGNORECASE
 )
 
-# Twitter/X - поддержка обоих доменов и всех форматов
+# регулярные выражения для Twitter/X
 TWITTER_RE = re.compile(
     r"(?:https?://)?(?:twitter\.com|x\.com)/[^/]+/status/\d+",
     re.IGNORECASE
 )
 
-# VK - расширенная поддержка видео, клипов, стен и нового домена
+# регулярные выражения для VK (обновлено!)
 VK_RE = re.compile(
     r"(?:https?://)?(?:vk\.com|m\.vkvideo\.ru)/"
     r"(?:video-?\d+_\d+|clip-?\d+_\d+|wall-?\d+_\d+|z=video-?\d+_\d+)",
     re.IGNORECASE
 )
 
-# Reddit - поддержка всех форматов постов
+# регулярные выражения для Reddit
 REDDIT_RE = re.compile(
     r"(?:https?://)?(?:www\.)?reddit\.com/"
     r"(?:r/[^/]+/comments/[\w]+/[^/]+/[\w]+|comments/[\w]+/[^/]+/[\w]+)",
     re.IGNORECASE
 )
 
-# Pinterest - поддержка pin.it и всех региональных доменов
+# регулярные выражения для Pinterest (обновлено!)
 PINTEREST_RE = re.compile(
     r"(?:https?://)?(?:pinterest\.(?:com|ru|ca|de|fr|jp|uk|it|es|nl|se|pl|br|mx|co\.uk)|pin\.it)/[\w/-]+",
     re.IGNORECASE
 )
 
-# Dailymotion - поддержка всех форматов видео
+# регулярные выражения для Dailymotion
 DAILYMOTION_RE = re.compile(
     r"(?:https?://)?(?:www\.)?dailymotion\.com/(?:video/[\w-]+|embed/video/[\w-]+)",
     re.IGNORECASE
 )
 
-# Vimeo - поддержка видео, альбомов и каналов
+# регулярные выражения для Vimeo
 VIMEO_RE = re.compile(
     r"(?:https?://)?(?:www\.)?vimeo\.com/"
     r"(?:\d+|album/\d+/video/\d+|channels/[^/]+/\d+|ondemand/[^/]+/\d+)",
     re.IGNORECASE
 )
 
-# SoundCloud - поддержка треков и плейлистов
+# регулярные выражения для SoundCloud
 SOUNDCLOUD_RE = re.compile(
     r"(?:https?://)?(?:www\.)?soundcloud\.com/[^/]+/(?:[^/]+|sets/[^/]+)",
     re.IGNORECASE
 )
 
-# Прямые ссылки на файлы - улучшенный паттерн
+# регулярные выражения для прямых ссылок на файлы
 DIRECT_FILE_RE = re.compile(
     r"(?:https?://)?[^\s]+\.(?:mp4|mkv|webm|avi|mov|wmv|flv|mp3|m4a|wav|aac|ogg)"
     r"(?:\?[^#\s]*)?(?:#[^\s]*)?$",
     re.IGNORECASE
 )
 
-# Короткие/редирект домены
+# короткие/редирект домены (добавлен pin.it)
 SHORTENER_DOMAINS = (
     "t.co", "t.me", "bit.ly", "tinyurl.com", "lnkd.in", "goo.gl", "rb.gy",
     "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com", "www.tiktok.com", "tiktok.com",
@@ -136,7 +138,7 @@ SHORTENER_DOMAINS = (
     "dailymotion.com", "vimeo.com", "soundcloud.com"
 )
 
-# YouTube - поддержка всех форматов
+# YouTube patterns
 YOUTUBE_VIDEO_RE = re.compile(
     r"(?:https?://)?(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|embed/|v/))[\w-]+",
     re.IGNORECASE
@@ -149,12 +151,8 @@ YTDL_BASE_OPTS = {"nocheckcertificate": True, "quiet": True, "no_warnings": True
 class DownloadErrorType:
     """Типы ошибок для классификации"""
     UNSUPPORTED_URL = "unsupported_url"
-    PRIVATE_VIDEO = "private_video"
-    AGE_RESTRICTED = "age_restricted"
     NETWORK_ERROR = "network_error"
     FILE_TOO_LARGE = "file_too_large"
-    INVALID_COOKIES = "invalid_cookies"
-    EXTERNAL_SERVICE_ERROR = "external_service_error"
     INTERNAL_ERROR = "internal_error"
     RATE_LIMITED = "rate_limited"
     URL_NOT_FOUND = "url_not_found"
@@ -176,26 +174,6 @@ class ErrorManager:
                     ],
                     "example": "Пример правильной ссылки: https://x.com/username/status/123456789"
                 },
-                DownloadErrorType.PRIVATE_VIDEO: {
-                    "title": "🔒 Приватное видео",
-                    "description": "Это видео доступно только авторизованным пользователям. Чтобы скачать его:",
-                    "details": [
-                        "1. Отправьте команду /cookies",
-                        "2. Загрузите файл cookies.txt из вашего браузера",
-                        "3. Убедитесь, что ваш аккаунт имеет доступ к этому видео"
-                    ],
-                    "additional": "Подробнее о том, как получить cookies, читайте в нашем канале: @BlackVeilInfo"
-                },
-                DownloadErrorType.AGE_RESTRICTED: {
-                    "title": "🔞 Возрастные ограничения",
-                    "description": "Это видео имеет возрастные ограничения. Чтобы скачать его:",
-                    "details": [
-                        "1. Отправьте команду /cookies",
-                        "2. Загрузите файл cookies.txt из вашего браузера",
-                        "3. Убедитесь, что в вашем аккаунте установлен правильный возраст"
-                    ],
-                    "additional": "Если вы уверены, что ваш возраст соответствует требованиям, попробуйте войти в аккаунт через браузер и подтвердить возраст"
-                },
                 DownloadErrorType.NETWORK_ERROR: {
                     "title": "🌐 Проблемы с сетью",
                     "description": "Не удалось загрузить видео из-за временных проблем с сетью. Попробуйте:",
@@ -214,16 +192,6 @@ class ErrorManager:
                         "2. Используйте кнопку 'Скачать через transfer.sh' для получения ссылки",
                         "3. Обрежьте видео до нужного фрагмента с помощью команды /trim"
                     ]
-                },
-                DownloadErrorType.INVALID_COOKIES: {
-                    "title": "🍪 Некорректные cookies",
-                    "description": "Проблема с файлом cookies. Проверьте:",
-                    "details": [
-                        "1. Формат файла (должен быть Netscape HTTP Cookie File)",
-                        "2. Срок действия cookies (обычно 1-2 недели)",
-                        "3. Платформу, для которой созданы cookies"
-                    ],
-                    "additional": "Для получения новых cookies воспользуйтесь расширением 'Get cookies.txt' в браузере"
                 },
                 DownloadErrorType.RATE_LIMITED: {
                     "title": "⏱️ Слишком много запросов",
@@ -283,26 +251,6 @@ class ErrorManager:
                     ],
                     "example": "Example of a correct link: https://x.com/username/status/123456789"
                 },
-                DownloadErrorType.PRIVATE_VIDEO: {
-                    "title": "🔒 Private video",
-                    "description": "This video is available only to authorized users. To download it:",
-                    "details": [
-                        "1. Send the /cookies command",
-                        "2. Upload the cookies.txt file from your browser",
-                        "3. Make sure your account has access to this video"
-                    ],
-                    "additional": "For more information on how to get cookies, see our channel: @BlackVeilInfo"
-                },
-                DownloadErrorType.AGE_RESTRICTED: {
-                    "title": "🔞 Age restricted",
-                    "description": "This video has age restrictions. To download it:",
-                    "details": [
-                        "1. Send the /cookies command",
-                        "2. Upload the cookies.txt file from your browser",
-                        "3. Make sure your account has the correct age set"
-                    ],
-                    "additional": "If you're sure your age meets the requirements, try logging in via browser and confirming your age"
-                },
                 DownloadErrorType.NETWORK_ERROR: {
                     "title": "🌐 Network issues",
                     "description": "Failed to download video due to temporary network problems. Try:",
@@ -321,16 +269,6 @@ class ErrorManager:
                         "2. Use 'Download via transfer.sh' button to get a link",
                         "3. Trim video to needed fragment using /trim command"
                     ]
-                },
-                DownloadErrorType.INVALID_COOKIES: {
-                    "title": "🍪 Invalid cookies",
-                    "description": "Problem with cookies file. Check:",
-                    "details": [
-                        "1. File format (should be Netscape HTTP Cookie File)",
-                        "2. Cookies expiration (usually 1-2 weeks)",
-                        "3. Platform for which cookies were created"
-                    ],
-                    "additional": "To get new cookies, use 'Get cookies.txt' extension in your browser"
                 },
                 DownloadErrorType.RATE_LIMITED: {
                     "title": "⏱️ Too many requests",
@@ -386,16 +324,10 @@ class ErrorManager:
         error_msg = str(error).lower()
         if "unsupported url" in error_msg or isinstance(error, UnsupportedError):
             return DownloadErrorType.UNSUPPORTED_URL
-        elif "age restricted" in error_msg or "restricted video" in error_msg:
-            return DownloadErrorType.AGE_RESTRICTED
-        elif "private" in error_msg or "login required" in error_msg:
-            return DownloadErrorType.PRIVATE_VIDEO
         elif "network" in error_msg or "timeout" in error_msg or "connection" in error_msg:
             return DownloadErrorType.NETWORK_ERROR
         elif "file too large" in error_msg or "exceeds file size limit" in error_msg:
             return DownloadErrorType.FILE_TOO_LARGE
-        elif "cookies" in error_msg or "authentication" in error_msg or "not authorized" in error_msg:
-            return DownloadErrorType.INVALID_COOKIES
         elif "429" in error_msg or "rate limit" in error_msg:
             return DownloadErrorType.RATE_LIMITED
         elif "not found" in error_msg or "unable to download" in error_msg:
@@ -412,36 +344,23 @@ class ErrorManager:
         if lang is None or lang not in self.error_messages:
             lang = self.default_lang
         error_data = self.error_messages.get(lang, {}).get(error_type)
-        if not error_data:  # ←←← ИСПРАВЛЕНО: было error_
+        if not error_
             # Если для данного языка нет сообщения, используем русский
             error_data = self.error_messages["ru"].get(error_type)
-        if not error_data:  # ←←← ИСПРАВЛЕНО: было error_
+        if not error_
             return "⚠️ Произошла неизвестная ошибка. Пожалуйста, попробуйте позже."
         # Формируем сообщение
         message = f"<b>{error_data['title']}</b>\n"
         message += f"{error_data['description']}\n"
         for detail in error_data.get("details", []):
             message += f"{detail}\n"
-        if "example" in error_data:  # ←←← ИСПРАВЛЕНО: было error_
+        if "example" in error_
             message += f"\n<i>Пример:</i>\n<code>{error_data['example']}</code>"
-        if "additional" in error_data:  # ←←← ИСПРАВЛЕНО: было error_
+        if "additional" in error_
             message += f"\nℹ️ {error_data['additional']}"
         # Добавляем кнопку для повторной попытки для некоторых типов ошибок
         if error_type in [DownloadErrorType.NETWORK_ERROR, DownloadErrorType.RATE_LIMITED, DownloadErrorType.URL_NOT_FOUND]:
             message += "\n🔄 Чтобы попробовать снова, нажмите кнопку ниже"
-
-        # Специальное сообщение для Instagram (теперь безопасно!)
-        if url and "instagram.com" in url and error_type == DownloadErrorType.INTERNAL_ERROR:
-            message = (
-                "⚠️ <b>Ошибка при скачивании с Instagram</b>\n\n"
-                "▫️ Instagram изменил структуру страницы, и я пока не могу скачать это видео.\n\n"
-                "✅ <b>Что можно сделать:</b>\n"
-                "• Попробуйте через 5-10 минут — возможно, это временный сбой\n"
-                "• Отправьте ссылку заново\n"
-                "• Используйте другой бот или сервис для скачивания\n\n"
-                "🔧 Я работаю над исправлением этой ошибки!"
-            )
-
         return message
 
 # Инициализация менеджера ошибок
@@ -457,7 +376,7 @@ class GroupFilter(BaseFilter):
         self.bot_username = bot_username.lower()
         # Поддерживаемые домены
         self.supported_domains = [
-            "tiktok.com", "vm.tiktok.com", "m.tiktok.com",
+            "tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com",
             "youtube.com", "youtu.be", "instagram.com", "facebook.com",
             "twitter.com", "x.com", "vk.com", "m.vkvideo.ru", "reddit.com", "pinterest.com", "pin.it",
             "dailymotion.com", "vimeo.com", "soundcloud.com"
@@ -492,7 +411,7 @@ class GroupFilter(BaseFilter):
                 # Удаляем / и возможное упоминание бота
                 command = command_parts[0][1:].split("@")[0]
                 # Список поддерживаемых команд
-                supported_commands = ["start", "help", "cookies", "history", "setup", "addnews"]
+                supported_commands = ["start", "help", "history", "addnews"]
                 if command in supported_commands:
                     logger.debug(f"Найдена поддерживаемая команда в группе от {message.from_user.id}: /{command}")
                     return True
@@ -572,7 +491,7 @@ class UserSettings:
             return False
         finally:
             conn.close()
-
+            
     def get_all_user_ids(self) -> List[int]:
         """Получает список всех пользователей, которые использовали бота"""
         conn = sqlite3.connect(self.db_path)
@@ -586,7 +505,6 @@ class UserSettings:
             return []
         finally:
             conn.close()
-
 
 # Инициализация менеджера настроек
 user_settings = UserSettings()
@@ -717,10 +635,10 @@ class DownloadManager:
                             message_id=status_msg.message_id,
                             text="📥 Скачиваю видео с Instagram..."
                         )
-                        filepath = await asyncio.to_thread(download_instagram_video, url, tempdir, mode, user_id)
+                        filepath = await asyncio.to_thread(download_instagram_video, url, tempdir, mode)
                     else:
                         # Используем yt-dlp для всех остальных платформ
-                        func = partial(ytdl_download, url, tempdir, mode, progress_hook, user_id)
+                        func = partial(ytdl_download, url, tempdir, mode, progress_hook)
                         filepath = await asyncio.wait_for(loop.run_in_executor(None, func), timeout=420)
 
                     # Сохраняем в кэш
@@ -730,17 +648,13 @@ class DownloadManager:
                     # Отправляем файл
                     await self._send_file(callback_query, url, filepath, mode, status_msg.message_id)
                 except Exception as e:
-                    # Если ошибка связана с приватным видео на Instagram, показываем другое сообщение
-                    if "instagram.com" in url.lower() and "private" in str(e).lower():
-                        await self._handle_download_error(callback_query, DownloadError("Это приватный аккаунт или Stories. Для скачивания нужен файл cookies."), url, status_msg.message_id)
-                    else:
-                        await self._handle_download_error(callback_query, e, url, status_msg.message_id)
-                finally:
-                    try:
-                        if tempdir and os.path.isdir(tempdir):
-                            shutil.rmtree(tempdir)
-                    except Exception:
-                        pass
+                    await self._handle_download_error(callback_query, e, url, status_msg.message_id)
+            finally:
+                try:
+                    if tempdir and os.path.isdir(tempdir):
+                        shutil.rmtree(tempdir)
+                except Exception:
+                    pass
         except Exception as e:
             logger.exception("Ошибка при обработке загрузки")
             try:
@@ -931,10 +845,6 @@ class DownloadManager:
         if error_type in [DownloadErrorType.NETWORK_ERROR, DownloadErrorType.RATE_LIMITED, DownloadErrorType.URL_NOT_FOUND]:
             action_kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Повторить загрузку", callback_data=f"retry:auto:{url}")]
-            ])
-        elif error_type in [DownloadErrorType.PRIVATE_VIDEO, DownloadErrorType.AGE_RESTRICTED, DownloadErrorType.INVALID_COOKIES]:
-            action_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🍪 Настроить cookies", callback_data="setup:cookies")]
             ])
 
         # Отправляем сообщение
@@ -1208,11 +1118,7 @@ class HistoryManager:
         finally:
             conn.close()
 
-# ===== ПОДДЕРЖКА COOKIES =====
-COOKIES_DIR = "cookies"
-os.makedirs(COOKIES_DIR, exist_ok=True)
-USER_COOKIES = {}  # Словарь для хранения путей к cookies файлам пользователей
-
+# ===== Глобальные переменные =====
 # Глобальный словарь для хранения временных ссылок для кнопки "Повторить загрузку"
 RETRY_LINKS = {}
 RETRY_LINKS_EXPIRY = 3600  # Время жизни записей в секундах (1 час)
@@ -1230,25 +1136,6 @@ async def cleanup_retry_links():
             logger.error(f"Ошибка при очистке RETRY_LINKS: {e}")
         # Проверяем каждые 10 минут
         await asyncio.sleep(600)
-
-def get_cookies_path(user_id: int) -> str:
-    """Получить путь к cookies файлу пользователя"""
-    return os.path.join(COOKIES_DIR, f"{user_id}.txt")
-
-def setup_user_cookies(user_id: int, cookies_file: str) -> str:
-    """Настроить cookies для пользователя"""
-    dest_path = get_cookies_path(user_id)
-    shutil.copy2(cookies_file, dest_path)
-    USER_COOKIES[user_id] = dest_path
-    return dest_path
-
-def get_ytdl_options(user_id: Optional[int] = None):
-    """Получить настройки yt-dlp с учетом cookies пользователя"""
-    opts = YTDL_BASE_OPTS.copy()
-    # Добавляем cookies, если они есть для пользователя
-    if user_id and user_id in USER_COOKIES:
-        opts["cookiefile"] = USER_COOKIES[user_id]
-    return opts
 
 # ---- helper functions ----
 def find_first_url(text: str) -> Optional[str]:
@@ -1502,211 +1389,165 @@ def normalize_reddit_url(url: str) -> Optional[str]:
         logger.exception("normalize_reddit_url error for %s", url)
     return None
 
-import instaloader
-
-
-def _load_cookies_for_requests(cookie_path: str) -> dict:
-    """Parse Netscape-format cookies.txt into a dict suitable for requests.Session().cookies.set"""
-    cookies = {}
-    try:
-        with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) >= 7:
-                    # domain, flag, path, secure, expiration, name, value
-                    name = parts[5]
-                    value = parts[6]
-                    cookies[name] = value
-    except Exception:
-        pass
-    return cookies
-
-def download_instagram_video(url: str, out_dir: str, mode: str = "video", user_id: Optional[int] = None) -> str:
+def download_instagram_video(url: str, out_dir: str, mode: str = "video") -> str:
     """
-    Improved Instagram downloader:
-    - Uses user's cookies (if uploaded) to access private content
-    - Tries multiple fallbacks: og:video, JSON-LD, window._sharedData, instaloader.Post
-    - Returns path to downloaded file
+    Скачивает видео или аудио с Instagram без использования yt-dlp.
+    Работает для публичных постов без cookies.
     """
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9"
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Referer": "https://www.instagram.com/",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-IG-App-ID": "936619743392459",
+        "X-ASBD-ID": "129477",
+        "X-IG-WWW-Claim": "0",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "TE": "trailers",
     }
+
+    # Получаем HTML страницы
     session = requests.Session()
-    session.headers.update(headers)
-
-    # If user provided cookies for authenticated access, load them
-    if user_id and user_id in USER_COOKIES:
+    
+    for attempt in range(3):  # Попробуем 3 раза
         try:
-            cookie_path = USER_COOKIES[user_id]
-            cookie_dict = _load_cookies_for_requests(cookie_path)
-            for k, v in cookie_dict.items():
-                session.cookies.set(k, v)
-        except Exception:
-            pass
+            r = session.get(url, headers=headers, timeout=30)
+            if r.status_code != 200:
+                raise Exception(f"Не удалось загрузить страницу Instagram: {r.status_code}")
 
-    # normalize shortcode
-    shortcode = None
-    try:
-        if "/reel/" in url:
-            shortcode = url.split("/reel/")[1].split("/")[0]
-        elif "/p/" in url:
-            shortcode = url.split("/p/")[1].split("/")[0]
-        elif "/tv/" in url:
-            shortcode = url.split("/tv/")[1].split("/")[0]
-        elif "/stories/" in url:
-            # stories URL often contains username and story id; use the last segment as id if present
-            parts = url.strip("/").split("/")
-            if len(parts) >= 3:
-                shortcode = parts[-1]
-    except Exception:
-        shortcode = None
-
-    tempname = f"instagram_{shortcode or uuid.uuid4().hex}"
-    filename = f"{tempname}.mp4" if mode != "audio" else f"{tempname}.mp3"
-    filepath = os.path.join(out_dir, filename)
-
-    # Helper to try download from direct video url
-    def _download_from_video_url(video_url: str) -> bool:
-        try:
-            if not video_url:
-                return False
-            with session.get(video_url, stream=True, timeout=300) as r:
-                r.raise_for_status()
-                with open(filepath, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-            return True
-        except Exception:
-            return False
-
-    # 1) Try fetching page HTML and parsing meta tags / JSON-LD
-    try:
-        r = session.get(url, timeout=15)
-        if r.status_code == 200:
-            html = r.text
-            # meta og:video
-            m = re.search(r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-            if not m:
-                m = re.search(r'<meta[^>]+property=["\']og:video:secure_url["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-            if m:
-                vurl = m.group(1)
-                if _download_from_video_url(vurl):
-                    # convert to mp3 if requested
-                    if mode == "audio":
-                        try:
-                            import subprocess
-                            audio_fp = filepath.replace(".mp4", ".mp3")
-                            subprocess.run(["ffmpeg", "-y", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_fp], check=True, capture_output=True)
-                            os.remove(filepath)
-                            filepath = audio_fp
-                        except Exception:
-                            pass
-                    return filepath
-
-            # 2) JSON-LD contentUrl
-            ld = extract_jsonld(html)
-            if isinstance(ld, dict):
-                cu = ld.get("contentUrl") or ld.get("url")
-                if cu and _download_from_video_url(cu):
-                    if mode == "audio":
-                        try:
-                            import subprocess
-                            audio_fp = filepath.replace(".mp4", ".mp3")
-                            subprocess.run(["ffmpeg", "-y", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_fp], check=True, capture_output=True)
-                            os.remove(filepath)
-                            filepath = audio_fp
-                        except Exception:
-                            pass
-                    return filepath
-
-            # 3) window._sharedData or other JSON blobs with video_url or display_resources
-            m = re.search(r'window\._sharedData\s*=\s*({.*?});', html, re.DOTALL)
-            if m:
+            # Ищем JSON с данными поста (новый метод)
+            # Instagram часто меняет структуру, поэтому пробуем несколько вариантов
+            data = None
+            
+            # Вариант 1: Поиск через window.__additionalDataLoaded
+            match = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);', r.text, re.DOTALL)
+            if match:
                 try:
-                    data = json.loads(m.group(1))
-                    # try common paths
-                    entry = data.get("entry_data", {})
-                    for k in ("PostPage", "ReelPage", "ProfilePage"):
-                        if k in entry:
-                            items = entry[k]
-                            if items and isinstance(items, list):
-                                for it in items:
-                                    # drill for video_url or display_resources
-                                    video_url = None
-                                    for candidate in ("video_url", "videoUrl", "display_url"):
-                                        video_url = it.get("graphql", {}).get("shortcode_media", {}).get(candidate) if isinstance(it, dict) else None
-                                        if video_url:
-                                            if _download_from_video_url(video_url):
-                                                if mode == "audio":
-                                                    try:
-                                                        import subprocess
-                                                        audio_fp = filepath.replace(".mp4", ".mp3")
-                                                        subprocess.run(["ffmpeg", "-y", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_fp], check=True, capture_output=True)
-                                                        os.remove(filepath)
-                                                        filepath = audio_fp
-                                                    except Exception:
-                                                        pass
-                                                return filepath
+                    data = json.loads(match.group(1))
                 except Exception:
                     pass
 
-            # 4) fallback: search for video_url in HTML
-            m = re.search(r'\"video_url\"\s*:\s*\"([^\"]+)\"', html)
-            if m:
-                v = m.group(1).encode("utf-8").decode("unicode_escape")
-                if _download_from_video_url(v):
-                    if mode == "audio":
-                        try:
-                            import subprocess
-                            audio_fp = filepath.replace(".mp4", ".mp3")
-                            subprocess.run(["ffmpeg", "-y", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_fp], check=True, capture_output=True)
-                            os.remove(filepath)
-                            filepath = audio_fp
-                        except Exception:
-                            pass
-                    return filepath
-    except Exception:
-        pass
+            # Вариант 2: Поиск через script с типом application/json
+            if not data:
+                match = re.search(r'<script type="application/json" data-s="[^"]*" data-p="[^"]*" data-b="[^"]*">(.+?)</script>', r.text, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                    except Exception:
+                        pass
 
-    # 5) Last resort: try instaloader (may fail for private content unless cookies/session provided)
-    try:
-        L = instaloader.Instaloader(download_videos=True, download_geotags=False, download_comments=False, save_metadata=False, compress_json=False)
-        # If user cookies available, attempt to set sessionid if present
-        try:
-            if user_id and user_id in USER_COOKIES:
-                cookie_path = USER_COOKIES[user_id]
-                cookie_dict = _load_cookies_for_requests(cookie_path)
-                # If sessionid present, add to Instaloader context cookies
-                if "sessionid" in cookie_dict:
-                    L.context._session.cookies.set("sessionid", cookie_dict["sessionid"])
-        except Exception:
-            pass
+            # Вариант 3: Поиск через window.__initialDataLoaded
+            if not data:
+                match = re.search(r'window\.__initialDataLoaded\([^,]+,\s*({.+?})\);', r.text, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                    except Exception:
+                        pass
 
-        if shortcode:
-            post = instaloader.Post.from_shortcode(L.context, shortcode)
-            if post.is_video:
-                video_url = getattr(post, "video_url", None)
-                if video_url and _download_from_video_url(video_url):
-                    if mode == "audio":
-                        try:
-                            import subprocess
-                            audio_fp = filepath.replace(".mp4", ".mp3")
-                            subprocess.run(["ffmpeg", "-y", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_fp], check=True, capture_output=True)
-                            os.remove(filepath)
-                            filepath = audio_fp
-                        except Exception:
-                            pass
-                    return filepath
-    except Exception:
-        pass
+            # Вариант 4: Поиск через sharedData
+            if not data:
+                match = re.search(r'window\.__sharedData\s*=\s*({.+?});', r.text, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                    except Exception:
+                        pass
 
-    # If we reach here — failed to download
-    raise Exception("Не удалось получить видео с Instagram. Возможно, это приватный контент или URL изменился.")
+            if not data:
+                raise Exception("Не удалось найти данные поста на странице Instagram")
+
+            # Навигация по структуре данных
+            post_data = {}
+            
+            # Попытка найти данные поста
+            if isinstance(data, dict):
+                # Для Reels и новых постов
+                if "require" in data and len(data["require"]) > 0:
+                    require_data = data["require"][0]
+                    if len(require_data) > 3 and isinstance(require_data[3], list) and len(require_data[3]) > 0:
+                        bbox = require_data[3][0].get("__bbox", {}).get("result", {})
+                        if "data" in bbox:
+                            post_data = bbox["data"]
+                
+                # Для старых постов
+                if not post_data and "entry_data" in data and "PostPage" in data["entry_data"] and len(data["entry_data"]["PostPage"]) > 0:
+                    post_data = data["entry_data"]["PostPage"][0].get("graphql", {}).get("shortcode_media", {})
+                
+                # Альтернативный путь для Reels
+                if not post_data and "props" in data and "pageProps" in data["props"] and "data" in data["props"]["pageProps"]:
+                    post_data = data["props"]["pageProps"]["data"].get("shortcode_media", {})
+                
+                # Еще один путь для Reels
+                if not post_data and "graphql" in data and "shortcode_media" in data["graphql"]:
+                    post_data = data["graphql"]["shortcode_media"]
+
+            # Ищем видео
+            video_url = None
+            
+            # Для Reels
+            if "shortcode_media" in post_data:
+                media = post_data["shortcode_media"]
+                if media.get("__typename") == "GraphVideo" or media.get("is_video"):
+                    video_url = media.get("video_url") or media.get("hd_url") or media.get("video_versions", [{}])[0].get("url")
+            elif post_data.get("__typename") == "GraphVideo" or post_data.get("is_video"):
+                video_url = post_data.get("video_url") or post_data.get("hd_url") or post_data.get("video_versions", [{}])[0].get("url")
+            # Для каруселей (несколько видео)
+            elif post_data.get("__typename") == "GraphSidecar":
+                edges = post_data.get("edge_sidecar_to_children", {}).get("edges", [])
+                if edges:
+                    for edge in edges:
+                        node = edge.get("node", {})
+                        if node.get("__typename") == "GraphVideo":
+                            video_url = node.get("video_url")
+                            break
+
+            if not video_url:
+                raise Exception("Видео не найдено в посте Instagram")
+
+            # Генерируем имя файла
+            filename = f"instagram_{int(time.time())}"
+            if mode == "audio":
+                filename += ".mp3"
+            else:
+                filename += ".mp4"
+
+            filepath = os.path.join(out_dir, filename)
+
+            # Скачиваем видео
+            with requests.get(video_url, headers=headers, stream=True, timeout=300) as r:
+                r.raise_for_status()
+                with open(filepath, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+            # Если нужен только аудио — конвертируем
+            if mode == "audio":
+                try:
+                    import subprocess
+                    audio_filepath = filepath.replace(".mp4", ".mp3")
+                    subprocess.run([
+                        "ffmpeg", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_filepath
+                    ], check=True, capture_output=True)
+                    # Удаляем оригинальный видеофайл
+                    os.remove(filepath)
+                    filepath = audio_filepath
+                except Exception as e:
+                    logger.warning(f"Не удалось извлечь аудио: {e}. Оставляем видео.")
+
+            return filepath
+
+        except Exception as e:
+            if attempt < 2:  # Если это не последняя попытка
+                time.sleep(2)  # Ждем 2 секунды перед повторной попыткой
+                continue
+            else:
+                raise e  # Если все попытки неудачны, выбрасываем исключение
 
 def is_youtube_video(url: str) -> bool:
     return bool(YOUTUBE_VIDEO_RE.search(url or ""))
@@ -1764,11 +1605,11 @@ def upload_to_transfersh(path: str) -> Optional[str]:
     return None
 
 # ---- yt-dlp download ----
-def ytdl_download(url: str, out_dir: str, mode: str, progress_hook=None, user_id: Optional[int] = None) -> str:
+def ytdl_download(url: str, out_dir: str, mode: str, progress_hook=None) -> str:
     """
-    Прямая загрузка через yt-dlp. Поддерживает прогресс-хук и cookies.
+    Прямая загрузка через yt-dlp. Поддерживает прогресс-хук.
     """
-    opts = get_ytdl_options(user_id)
+    opts = YTDL_BASE_OPTS.copy()
     opts["outtmpl"] = os.path.join(out_dir, "%(id)s.%(ext)s")
     if mode == "audio":
         opts.update({
@@ -1903,66 +1744,6 @@ async def cmd_start(message: types.Message):
         reply_markup=keyboard
     )
 
-async def cmd_cookies(message: types.Message):
-    """Обработчик команды /cookies для загрузки файла cookies"""
-    await message.reply(
-        "Пожалуйста, отправьте файл cookies.txt.\n"
-        "Это необходимо для загрузки приватных видео, видео с возрастными ограничениями "
-        "или видео, требующих авторизации.\n"
-        "Файл должен быть в формате Netscape HTTP Cookie File."
-    )
-
-def is_valid_netscape_cookie_file(file_path: str) -> bool:
-    """Проверяет, является ли файл корректным Netscape HTTP Cookie File"""
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        
-        # Пропускаем комментарии
-        cookie_lines = [line.strip() for line in lines if line.strip() and not line.startswith('#')]
-        
-        if not cookie_lines:
-            return False
-        
-        for line in cookie_lines:
-            parts = line.split('\t')
-            if len(parts) < 7:
-                return False
-            # Проверяем, что 5-й элемент (expiration timestamp) — это число
-            try:
-                int(parts[4])
-            except ValueError:
-                return False
-                
-        return True
-    except Exception:
-        return False
-
-async def handle_cookies_file(message: types.Message):
-    """Обработка загруженного файла cookies"""
-    if message.document is None or message.document.file_name != "cookies.txt":
-        if message.document:
-            await message.reply("Пожалуйста, отправьте файл с именем cookies.txt")
-        return
-    file = await bot.get_file(message.document.file_id)
-    file_path = file.file_path
-    cookies_dir = "cookies"
-    os.makedirs(cookies_dir, exist_ok=True)
-    user_cookies_path = os.path.join(cookies_dir, f"{message.from_user.id}.txt")
-    await bot.download_file(file_path, user_cookies_path)
-    # Проверяем, что файл содержит корректные cookies
-    if os.path.getsize(user_cookies_path) < 10:
-        os.remove(user_cookies_path)
-        await message.reply("Файл cookies.txt слишком маленький. Возможно, он поврежден.")
-        return
-    # Валидация формата
-    if not is_valid_netscape_cookie_file(user_cookies_path):
-        os.remove(user_cookies_path)
-        await message.reply("Файл cookies.txt имеет неверный формат. Убедитесь, что вы экспортировали его с помощью расширения 'Get cookies.txt'.")
-        return
-    USER_COOKIES[message.from_user.id] = user_cookies_path
-    await message.reply("Файл cookies успешно загружен! Теперь вы можете скачивать приватные видео.")
-
 def has_enough_disk_space(path: str, required_mb: int = 500) -> bool:
     """Проверяет, достаточно ли свободного места на диске"""
     try:
@@ -1973,14 +1754,8 @@ def has_enough_disk_space(path: str, required_mb: int = 500) -> bool:
         return True  # На случай ошибки, не блокируем загрузку
 
 async def handle_text(message: types.Message):
-    # Ignore bot commands (they are handled by command handlers)
-    if message.text and message.text.strip().startswith('/'):
-        return
     text = (message.text or "").strip()
     url = find_first_url(text)
-    # Ignore admin command /addnews so it won't be treated as a download request
-    if text.startswith("/addnews") or text.startswith(" /addnews"):
-        return
     # Если ссылка не найдена, но это личный чат - сообщаем об ошибке
     if not url:
         if message.chat.type == "private":
@@ -2101,7 +1876,41 @@ async def cmd_history(message: types.Message):
         [InlineKeyboardButton(text="🧹 Очистить историю", callback_data="history:clear")]
     ])
     await message.reply(text, reply_markup=clear_kb)
-    
+
+async def cb_history(callback: types.CallbackQuery):
+    """Обработчик колбэков для истории"""
+    data = callback.data
+    user_id = callback.from_user.id
+    if data == "history:clear":
+        if history_manager.clear_history(user_id):
+            await callback.message.edit_text("✅ История загрузок очищена.")
+        else:
+            await callback.answer("❌ Не удалось очистить историю.")
+    elif data == "history:view":
+        history = history_manager.get_history(user_id)
+        if not history:
+            await callback.message.edit_text("Ваша история загрузок пуста.")
+            return
+        text = "📜 Ваша история загрузок:\n"
+        for i, (url, file_type, timestamp) in enumerate(history, 1):
+            # Форматируем дату
+            try:
+                dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f") if '.' in timestamp else datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                date_str = dt.strftime("%d.%m.%Y %H:%M")
+            except:
+                date_str = timestamp
+            text += f"{i}. {date_str}\n"
+            text += f"🔗 {url}\n"
+            text += f"🎬 {'Видео' if file_type == 'video' else 'Аудио'}\n"
+        # Кнопка для очистки истории
+        clear_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧹 Очистить историю", callback_data="history:clear")]
+        ])
+        await callback.message.edit_text(text, reply_markup=clear_kb)
+    elif data == "start_download":
+        await callback.message.edit_text("Пришлите ссылку на видео, которое хотите скачать.")
+
+# Команда для рассылки новостей (только для администратора)
 async def cmd_addnews(message: types.Message):
     """Admin-only command: /addnews <text>
     Usage examples:
@@ -2207,103 +2016,6 @@ async def cmd_addnews(message: types.Message):
 
     await message.reply(f"Рассылка завершена. Отправлено: {sent}, Не удалось: {failed}")
 
-async def cb_history(callback: types.CallbackQuery):
-    """Обработчик колбэков для истории"""
-    data = callback.data
-    user_id = callback.from_user.id
-    if data == "history:clear":
-        if history_manager.clear_history(user_id):
-            await callback.message.edit_text("✅ История загрузок очищена.")
-        else:
-            await callback.answer("❌ Не удалось очистить историю.")
-    elif data == "history:view":
-        history = history_manager.get_history(user_id)
-        if not history:
-            await callback.message.edit_text("Ваша история загрузок пуста.")
-            return
-        text = "📜 Ваша история загрузок:\n"
-        for i, (url, file_type, timestamp) in enumerate(history, 1):
-            # Форматируем дату
-            try:
-                dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S.%f") if '.' in timestamp else datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-                date_str = dt.strftime("%d.%m.%Y %H:%M")
-            except:
-                date_str = timestamp
-            text += f"{i}. {date_str}\n"
-            text += f"🔗 {url}\n"
-            text += f"🎬 {'Видео' if file_type == 'video' else 'Аудио'}\n"
-        # Кнопка для очистки истории
-        clear_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🧹 Очистить историю", callback_data="history:clear")]
-        ])
-        await callback.message.edit_text(text, reply_markup=clear_kb)
-    elif data == "start_download":
-        await callback.message.edit_text("Пришлите ссылку на видео, которое хотите скачать.")
-
-# Обработчик для настройки cookies через интерактивный мастер
-async def cb_setup_cookies(callback: types.CallbackQuery):
-    """Запускает мастер настройки cookies"""
-    await callback.answer("Запуск мастера настройки cookies...")
-    user_id = callback.from_user.id
-    lang = user_settings.get_settings(user_id)["language"]
-    # Сообщение о начале настройки cookies
-    setup_message = (
-        "<b>🍪 Настройка cookies</b>\n"
-        "Этот мастер поможет вам настроить cookies для доступа к приватным видео.\n"
-        "1. Установите расширение <a href='https://chrome.google.com/webstore/detail/get-cookiestxt/bgaddhkoddajcdgocldbbfleckgcbcid'>Get cookies.txt</a>\n"
-        "2. Зайдите на платформу, с которой хотите скачивать приватные видео\n"
-        "3. Нажмите на значок расширения и выберите 'Save as cookies.txt'\n"
-        "4. Загрузите полученный файл сюда"
-    )
-    # Кнопки управления
-    setup_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="TikTok", callback_data="setup:platform_tiktok"),
-            InlineKeyboardButton(text="Instagram", callback_data="setup:platform_instagram")
-        ],
-        [
-            InlineKeyboardButton(text="YouTube", callback_data="setup:platform_youtube"),
-            InlineKeyboardButton(text="Facebook", callback_data="setup:platform_facebook")
-        ],
-        [
-            InlineKeyboardButton(text="Twitter/X", callback_data="setup:platform_twitter"),
-            InlineKeyboardButton(text="VK", callback_data="setup:platform_vk")
-        ],
-        [
-            InlineKeyboardButton(text="Reddit", callback_data="setup:platform_reddit"),
-            InlineKeyboardButton(text="Pinterest", callback_data="setup:platform_pinterest")
-        ],
-        [
-            InlineKeyboardButton(text="Отмена", callback_data="setup:cancel")
-        ]
-    ])
-    await callback.message.edit_text(
-        setup_message,
-        reply_markup=setup_kb,
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
-
-async def cb_retry(callback: types.CallbackQuery):
-    """Обработчик кнопки 'Повторить загрузку'"""
-    data = callback.data
-    parts = data.split(":")
-    if len(parts) < 3:
-        await callback.answer("Некорректные данные.", show_alert=True)
-        return
-    _, mode, retry_id = parts[0], parts[1], parts[2]
-    # Получаем URL по уникальному ID
-    if retry_id not in RETRY_LINKS:
-        await callback.answer("Ссылка устарела. Пожалуйста, отправьте ссылку заново.", show_alert=True)
-        return
-    url, _ = RETRY_LINKS[retry_id]
-    # Добавляем загрузку в менеджер
-    await callback.answer("Начинаем повторную загрузку...")
-    await download_manager.add_download(callback, url, mode)
-    # Удаляем использованный ID из словаря
-    if retry_id in RETRY_LINKS:
-        del RETRY_LINKS[retry_id]
-
 # Обработчик для управления загрузкой (пауза/отмена)
 async def cb_progress_control(callback: types.CallbackQuery):
     """Обработчик кнопок управления загрузкой"""
@@ -2363,7 +2075,30 @@ async def cb_progress_control(callback: types.CallbackQuery):
         if task_id in ACTIVE_DOWNLOADS:
             del ACTIVE_DOWNLOADS[task_id]
 
+# Обработчик кнопки "Повторить загрузку"
+async def cb_retry(callback: types.CallbackQuery):
+    """Обработчик кнопки 'Повторить загрузку'"""
+    data = callback.data
+    parts = data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    _, mode, retry_id = parts[0], parts[1], parts[2]
+    # Получаем URL по уникальному ID
+    if retry_id not in RETRY_LINKS:
+        await callback.answer("Ссылка устарела. Пожалуйста, отправьте ссылку заново.", show_alert=True)
+        return
+    url, _ = RETRY_LINKS[retry_id]
+    # Добавляем загрузку в менеджер
+    await callback.answer("Начинаем повторную загрузку...")
+    await download_manager.add_download(callback, url, mode)
+    # Удаляем использованный ID из словаря
+    if retry_id in RETRY_LINKS:
+        del RETRY_LINKS[retry_id]
+
 # ===== ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK =====
+from aiohttp import web
+
 async def health_check(request):
     """Endpoint для проверки работоспособности сервиса"""
     return web.json_response({"status": "ok", "bot": "running"})
@@ -2407,18 +2142,15 @@ async def main():
 
     # Регистрируем обработчики
     dp.message.register(cmd_start, Command(commands=["start", "help"]), group_filter)
-    dp.message.register(cmd_cookies, Command(commands=["cookies"]), group_filter)
     dp.message.register(cmd_history, Command(commands=["history"]), group_filter)
-    dp.message.register(handle_cookies_file, F.document, group_filter)
-    dp.message.register(handle_text, F.text, group_filter)
     dp.message.register(cmd_addnews, Command(commands=["addnews"]), group_filter)
+    dp.message.register(handle_text, F.text, group_filter)
 
     # Колбэки работают всегда (после того, как пользователь начал взаимодействие)
     dp.callback_query.register(cb_download, F.data.startswith("dl:"))
     dp.callback_query.register(cb_history, F.data.startswith("history:"))
     dp.callback_query.register(cb_retry, F.data.startswith("retry:"))
     dp.callback_query.register(cb_progress_control, F.data.startswith("progress:"))
-    dp.callback_query.register(cb_setup_cookies, F.data == "setup:cookies")
 
     # Запускаем polling
     try:
@@ -2428,4 +2160,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
