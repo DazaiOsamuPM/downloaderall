@@ -48,53 +48,98 @@ dp = Dispatcher()
 PENDING_LINKS: Dict[int, str] = {}
 ACTIVE_DOWNLOADS: Dict[int, Dict[str, Any]] = {}  # Хранит информацию о текущих загрузках
 
-# ---- regex ----
-URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+# Улучшенный паттерн для поиска URL в тексте
+# Более точный, исключает лишние символы в конце
+URL_RE = re.compile(r"https?://[^\s<>'\"()\[\]{}]+", re.IGNORECASE)
 
-# расширенный набор паттернов для TikTok
+# ===== УЛУЧШЕННЫЕ РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ ДЛЯ ПЛАТФОРМ =====
+
+# TikTok - улучшенная поддержка всех форматов
 TIKTOK_ANY_RE = re.compile(
-    r"(?:vm\.tiktok\.com|m\.tiktok\.com|www\.tiktok\.com|tiktok\.com)/(?:@[^/\s]+/video/\d+|video/\d+|v/\d+|t/|share/|embed/|tag/|hashtag/|music/|@[^/\s]+)",
-    re.IGNORECASE,
+    r"(?:https?://)?(?:vm\.tiktok\.com|vt\.tiktok\.com|m\.tiktok\.com|www\.tiktok\.com|tiktok\.com)"
+    r"/(?:@[\w\.]+/video/\d+|video/\d+|v/\d+|t/\w+|share/\w+|embed/\d+|tag/[^/]+|hashtag/[^/]+|music/\d+|@[\w\.]+)",
+    re.IGNORECASE
 )
 
-# регулярные выражения для Instagram и Facebook
-INSTAGRAM_RE = re.compile(r"(?:www\.instagram\.com/p/|www\.instagram\.com/reel/|www\.instagram\.com/tv/)", re.IGNORECASE)
-FACEBOOK_RE = re.compile(r"(?:www\.facebook\.com/.+/videos/|www\.facebook\.com/video.php)", re.IGNORECASE)
+# Instagram - добавлена поддержка stories и IGTV
+INSTAGRAM_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?instagram\.com/"
+    r"(?:p/[^/]+|reel/[^/]+|tv/[^/]+|stories/[^/]+/[^/]+)",
+    re.IGNORECASE
+)
 
-# регулярные выражения для Twitter/X
-TWITTER_RE = re.compile(r"(?:twitter\.com|x\.com)/[^/]+/status/\d+", re.IGNORECASE)
+# Facebook - улучшенная поддержка разных форматов
+FACEBOOK_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?facebook\.com/"
+    r"(?:[^/]+/videos/\d+|video\.php\?v=\d+|watch/\?v=\d+)",
+    re.IGNORECASE
+)
 
-# регулярные выражения для VK (обновлено!)
-VK_RE = re.compile(r"(?:vk\.com/video-?\d+_\d+|vk\.com/clip-?\d+_\d+|vk\.com/wall-?\d+_\d+|m\.vkvideo\.ru/[\w/]+)", re.IGNORECASE)
+# Twitter/X - поддержка обоих доменов и всех форматов
+TWITTER_RE = re.compile(
+    r"(?:https?://)?(?:twitter\.com|x\.com)/[^/]+/status/\d+",
+    re.IGNORECASE
+)
 
-# регулярные выражения для Reddit
-REDDIT_RE = re.compile(r"reddit\.com/(?:r/[^/]+/comments/|comments/)[\w]+/[\w_-]+/[\w]+", re.IGNORECASE)
+# VK - расширенная поддержка видео, клипов, стен и нового домена
+VK_RE = re.compile(
+    r"(?:https?://)?(?:vk\.com|m\.vkvideo\.ru)/"
+    r"(?:video-?\d+_\d+|clip-?\d+_\d+|wall-?\d+_\d+|z=video-?\d+_\d+)",
+    re.IGNORECASE
+)
 
-# регулярные выражения для Pinterest (обновлено!)
-PINTEREST_RE = re.compile(r"(?:pinterest\.(?:com|ru|ca|de|fr|jp|uk|it|es|nl|se|pl|br|mx|co\.uk)|pin\.it)/[\w/-]+", re.IGNORECASE)
+# Reddit - поддержка всех форматов постов
+REDDIT_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?reddit\.com/"
+    r"(?:r/[^/]+/comments/[\w]+/[^/]+/[\w]+|comments/[\w]+/[^/]+/[\w]+)",
+    re.IGNORECASE
+)
 
-# регулярные выражения для Dailymotion
-DAILYMOTION_RE = re.compile(r"dailymotion\.com/video/[\w-]+", re.IGNORECASE)
+# Pinterest - поддержка pin.it и всех региональных доменов
+PINTEREST_RE = re.compile(
+    r"(?:https?://)?(?:pinterest\.(?:com|ru|ca|de|fr|jp|uk|it|es|nl|se|pl|br|mx|co\.uk)|pin\.it)/[\w/-]+",
+    re.IGNORECASE
+)
 
-# регулярные выражения для Vimeo
-VIMEO_RE = re.compile(r"vimeo\.com/(?:\d+|album/\d+/video/\d+)", re.IGNORECASE)
+# Dailymotion - поддержка всех форматов видео
+DAILYMOTION_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?dailymotion\.com/(?:video/[\w-]+|embed/video/[\w-]+)",
+    re.IGNORECASE
+)
 
-# регулярные выражения для SoundCloud
-SOUNDCLOUD_RE = re.compile(r"soundcloud\.com/[^/]+/[^/]+", re.IGNORECASE)
+# Vimeo - поддержка видео, альбомов и каналов
+VIMEO_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?vimeo\.com/"
+    r"(?:\d+|album/\d+/video/\d+|channels/[^/]+/\d+|ondemand/[^/]+/\d+)",
+    re.IGNORECASE
+)
 
-# регулярные выражения для прямых ссылок на файлы
-DIRECT_FILE_RE = re.compile(r".*\.(?:mp4|mkv|webm|avi|mov|wmv|flv|mp3|m4a|wav|aac|ogg)$", re.IGNORECASE)
+# SoundCloud - поддержка треков и плейлистов
+SOUNDCLOUD_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?soundcloud\.com/[^/]+/(?:[^/]+|sets/[^/]+)",
+    re.IGNORECASE
+)
 
-# короткие/редирект домены (добавлен pin.it)
+# Прямые ссылки на файлы - улучшенный паттерн
+DIRECT_FILE_RE = re.compile(
+    r"(?:https?://)?[^\s]+\.(?:mp4|mkv|webm|avi|mov|wmv|flv|mp3|m4a|wav|aac|ogg)"
+    r"(?:\?[^#\s]*)?(?:#[^\s]*)?$",
+    re.IGNORECASE
+)
+
+# Короткие/редирект домены
 SHORTENER_DOMAINS = (
     "t.co", "t.me", "bit.ly", "tinyurl.com", "lnkd.in", "goo.gl", "rb.gy",
-    "vm.tiktok.com", "m.tiktok.com", "www.tiktok.com", "tiktok.com",
+    "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com", "www.tiktok.com", "tiktok.com",
     "x.com", "twitter.com", "vk.com", "m.vkvideo.ru", "reddit.com", "pinterest.com", "pin.it",
     "dailymotion.com", "vimeo.com", "soundcloud.com"
 )
 
-# YouTube patterns
-YOUTUBE_VIDEO_RE = re.compile(r"(youtu\.be/|youtube\.com/(watch\?v=|shorts/|embed/))", re.IGNORECASE)
+# YouTube - поддержка всех форматов
+YOUTUBE_VIDEO_RE = re.compile(
+    r"(?:https?://)?(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|embed/|v/))[\w-]+",
+    re.IGNORECASE
+)
 
 # ---- yt-dlp base opts ----
 YTDL_BASE_OPTS = {"nocheckcertificate": True, "quiet": True, "no_warnings": True}
@@ -2120,3 +2165,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
