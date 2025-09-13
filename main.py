@@ -573,16 +573,16 @@ class UserSettings:
         finally:
             conn.close()
 
-    def get_all_user_ids(self) -> list:
-        """Возвращает список всех user_id из таблицы user_settings"""
+    def get_all_user_ids(self) -> List[int]:
+        """Получает список всех пользователей, которые использовали бота"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT user_id FROM user_settings")
-            rows = cursor.fetchall()
-            return [r[0] for r in rows]
+            cursor.execute("SELECT DISTINCT user_id FROM user_settings")
+            result = cursor.fetchall()
+            return [row[0] for row in result]
         except Exception as e:
-            logger.error(f"Error fetching all user ids: {e}")
+            logger.error(f"Error getting all user IDs: {e}")
             return []
         finally:
             conn.close()
@@ -1912,100 +1912,6 @@ async def cmd_cookies(message: types.Message):
         "Файл должен быть в формате Netscape HTTP Cookie File."
     )
 
-
-
-async def cmd_addnews(message: types.Message):
-    """Admin-only command: /addnews <text>
-    Usage examples:
-      /addnews Текст новости
-      /addnews button=Label|https://example.com Текст новости
-      /addnews https://example.com Текст новости  (will create a button from first URL)
-    You can also reply to a message with /addnews to forward that message as news.
-    """
-    ADMIN_ID = 6143311340
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        await message.reply("❌ Только администратор может использовать эту команду.")
-        return
-
-    # Try to get args after command. If empty, and this is a reply, take replied message text.
-    raw = (message.text or "").strip()
-    parts = raw.split(None, 1)
-    # Remove command mention if present (e.g., /addnews@Bot)
-    if parts:
-        parts[0] = re.sub(r'@\w+$', '', parts[0])
-    news_text = ""
-    if len(parts) >= 2 and parts[1].strip():
-        news_text = parts[1].strip()
-    elif message.reply_to_message and (message.reply_to_message.text or message.reply_to_message.caption):
-        # Use the replied-to message text or caption
-        news_text = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
-    else:
-        await message.reply("Использование: /addnews Текст новости.\nПример: /addnews Бота обновлен! Новые функции: ...\n\nДополнительно можно добавить кнопку: /addnews button=Label|https://example.com Текст")
-        return
-
-    # Detect explicit button token: button=Label|URL or button=URL
-    button_url = None
-    button_label = None
-    mbtn = re.search(r'button\s*[:=]\s*([^\s]+)', news_text, flags=re.IGNORECASE)
-    if mbtn:
-        btn_part = mbtn.group(1).strip()
-        if '|' in btn_part:
-            lbl, url = btn_part.split('|', 1)
-            button_label = lbl.strip()
-            button_url = url.strip()
-        else:
-            button_url = btn_part.strip()
-        # remove the token from the message
-        news_text = re.sub(r'button\s*[:=]\s*[^\s]+', '', news_text, flags=re.IGNORECASE).strip()
-
-    # If no explicit button, try to find first URL in the news_text and create a button from it
-    if not button_url:
-        found = find_first_url(news_text)
-        if found:
-            button_url = found
-            # remove the url from text to avoid double preview
-            news_text = news_text.replace(found, '').strip()
-            try:
-                parsed = urlparse(button_url)
-                button_label = parsed.netloc.replace('www.', '')
-            except Exception:
-                button_label = "Перейти"
-
-    # Prepare reply markup if button present
-    reply_kb = None
-    if button_url:
-        # Ensure URL has scheme
-        if not re.match(r'^https?://', button_url, flags=re.IGNORECASE):
-            button_url = 'https://' + button_url
-        if not button_label:
-            button_label = "🔗 Перейти"
-        reply_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=button_label, url=button_url)]
-        ])
-
-    # Prepare final message (if empty after stripping, put a placeholder)
-    if not news_text:
-        news_text = "📣 Новость"
-
-    # Broadcast
-    recipients = user_settings.get_all_user_ids()
-    if not recipients:
-        await message.reply("Нет подписчиков для рассылки.")
-        return
-
-    sent = 0
-    failed = 0
-    await message.reply(f"Начинаю рассылку новостей ({len(recipients)} пользователей)...")
-    # Send sequentially with small delay to avoid flood
-    for uid in recipients:
-        try:
-            await bot.send_message(uid, f"📣 <b>Новость от бота</b>\n\n{news_text}", parse_mode="HTML", reply_markup=reply_kb, disable_web_page_preview=True)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-    await message.reply(f"Рассылка завершена. Отправлено: {sent}, Не удалось: {failed}")
 def is_valid_netscape_cookie_file(file_path: str) -> bool:
     """Проверяет, является ли файл корректным Netscape HTTP Cookie File"""
     try:
@@ -2195,6 +2101,111 @@ async def cmd_history(message: types.Message):
         [InlineKeyboardButton(text="🧹 Очистить историю", callback_data="history:clear")]
     ])
     await message.reply(text, reply_markup=clear_kb)
+    
+async def cmd_addnews(message: types.Message):
+    """Admin-only command: /addnews <text>
+    Usage examples:
+    /addnews Текст новости
+    /addnews button=Label|https://example.com Текст новости
+    /addnews https://example.com Текст новости (will create a button from first URL)
+    You can also reply to a message with /addnews to forward that message as news.
+    """
+    ADMIN_ID = 6143311340  # Замените на ваш ID администратора
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("❌ Только администратор может использовать эту команду.")
+        return
+
+    # Try to get args after command. If empty, and this is a reply, take replied message text.
+    raw = (message.text or "").strip()
+    parts = raw.split(None, 1)
+    # Remove command mention if present (e.g., /addnews@Bot)
+    if parts:
+        parts[0] = re.sub(r'@\w+$', '', parts[0])
+    news_text = ""
+    if len(parts) >= 2 and parts[1].strip():
+        news_text = parts[1].strip()
+    elif message.reply_to_message and (message.reply_to_message.text or message.reply_to_message.caption):
+        # Use the replied-to message text or caption
+        news_text = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+    else:
+        await message.reply(
+            "Использование: /addnews Текст новости.\n"
+            "Пример: /addnews Бота обновлен! Новые функции: ...\n"
+            "Дополнительно можно добавить кнопку: /addnews button=Label|https://example.com Текст"
+        )
+        return
+
+    # Detect explicit button token: button=Label|URL or button=URL
+    button_url = None
+    button_label = None
+    mbtn = re.search(r'button\s*[:=]\s*([^\s]+)', news_text, flags=re.IGNORECASE)
+    if mbtn:
+        btn_part = mbtn.group(1).strip()
+        if '|' in btn_part:
+            # button=Label|URL
+            button_label, button_url = btn_part.split('|', 1)
+            button_label = button_label.strip()
+            button_url = button_url.strip()
+        else:
+            # button=URL
+            button_url = btn_part.strip()
+            button_label = "Перейти"
+        # Remove the button token from news_text
+        news_text = news_text.replace(mbtn.group(0), '').strip()
+
+    # If no explicit button, try to extract first URL from news_text
+    if not button_url:
+        murl = re.search(r'https?://[^\s<>"()]+', news_text, flags=re.IGNORECASE)
+        if murl:
+            button_url = murl.group(0)
+            button_label = "🔗 Перейти"
+            # Optionally remove URL from text? Or leave it.
+            # news_text = news_text.replace(button_url, '').strip()
+
+    # Prepare reply markup if button present
+    reply_kb = None
+    if button_url:
+        # Ensure URL has scheme
+        if not re.match(r'^https?://', button_url, flags=re.IGNORECASE):
+            button_url = 'https://' + button_url
+        if not button_label:
+            button_label = "🔗 Перейти"
+        reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=button_label, url=button_url)]
+        ])
+
+    # Prepare final message (if empty after stripping, put a placeholder)
+    if not news_text:
+        news_text = "📣 Новость"
+
+    # Broadcast
+    recipients = user_settings.get_all_user_ids()
+    if not recipients:
+        await message.reply("Нет подписчиков для рассылки.")
+        return
+
+    sent = 0
+    failed = 0
+    await message.reply(f"Начинаю рассылку новостей ({len(recipients)} пользователей)...")
+
+    # Send sequentially with small delay to avoid flood
+    for uid in recipients:
+        try:
+            await bot.send_message(
+                uid,
+                f"📣 <b>Новость от бота</b>\n\n{news_text}",
+                parse_mode="HTML",
+                reply_markup=reply_kb,
+                disable_web_page_preview=True
+            )
+            sent += 1
+            await asyncio.sleep(0.05)  # Задержка между отправкой сообщений
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение пользователю {uid}: {e}")
+            failed += 1
+
+    await message.reply(f"Рассылка завершена. Отправлено: {sent}, Не удалось: {failed}")
 
 async def cb_history(callback: types.CallbackQuery):
     """Обработчик колбэков для истории"""
@@ -2400,9 +2411,9 @@ async def main():
     dp.message.register(cmd_history, Command(commands=["history"]), group_filter)
     dp.message.register(handle_cookies_file, F.document, group_filter)
     dp.message.register(handle_text, F.text, group_filter)
+    dp.message.register(cmd_addnews, Command(commands=["addnews"]), group_filter)
 
     # Колбэки работают всегда (после того, как пользователь начал взаимодействие)
-    dp.message.register(cmd_addnews, Command(commands=["addnews"]), group_filter)
     dp.callback_query.register(cb_download, F.data.startswith("dl:"))
     dp.callback_query.register(cb_history, F.data.startswith("history:"))
     dp.callback_query.register(cb_retry, F.data.startswith("retry:"))
