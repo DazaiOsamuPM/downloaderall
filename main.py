@@ -1916,32 +1916,88 @@ async def cmd_cookies(message: types.Message):
 
 async def cmd_addnews(message: types.Message):
     """Admin-only command: /addnews <text>
-    Sends the provided text to all known users (from user_settings table).
+    Usage examples:
+      /addnews Текст новости
+      /addnews button=Label|https://example.com Текст новости
+      /addnews https://example.com Текст новости  (will create a button from first URL)
+    You can also reply to a message with /addnews to forward that message as news.
     """
     ADMIN_ID = 6143311340
     user_id = message.from_user.id
     if user_id != ADMIN_ID:
         await message.reply("❌ Только администратор может использовать эту команду.")
         return
-    text = (message.text or "").strip()
-    # support usage: /addnews <text>
-    parts = text.split(None, 1)
-    if len(parts) < 2:
-        await message.reply("Использование: /addnews Текст новости.\nПример: /addnews Бота обновлен! Новые функции: ...")
+
+    # Try to get args after command. If empty, and this is a reply, take replied message text.
+    raw = (message.text or "").strip()
+    parts = raw.split(None, 1)
+    news_text = ""
+    if len(parts) >= 2 and parts[1].strip():
+        news_text = parts[1].strip()
+    elif message.reply_to_message and (message.reply_to_message.text or message.reply_to_message.caption):
+        # Use the replied-to message text or caption
+        news_text = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+    else:
+        await message.reply("Использование: /addnews Текст новости.\nПример: /addnews Бота обновлен! Новые функции: ...\n\nДополнительно можно добавить кнопку: /addnews button=Label|https://example.com Текст")
         return
-    news_text = parts[1].strip()
-    # Get all users from settings DB
+
+    # Detect explicit button token: button=Label|URL or button=URL
+    button_url = None
+    button_label = None
+    mbtn = re.search(r'button\s*[:=]\s*([^\s]+)', news_text, flags=re.IGNORECASE)
+    if mbtn:
+        btn_part = mbtn.group(1).strip()
+        if '|' in btn_part:
+            lbl, url = btn_part.split('|', 1)
+            button_label = lbl.strip()
+            button_url = url.strip()
+        else:
+            button_url = btn_part.strip()
+        # remove the token from the message
+        news_text = re.sub(r'button\s*[:=]\s*[^\s]+', '', news_text, flags=re.IGNORECASE).strip()
+
+    # If no explicit button, try to find first URL in the news_text and create a button from it
+    if not button_url:
+        found = find_first_url(news_text)
+        if found:
+            button_url = found
+            # remove the url from text to avoid double preview
+            news_text = news_text.replace(found, '').strip()
+            try:
+                parsed = urlparse(button_url)
+                button_label = parsed.netloc.replace('www.', '')
+            except Exception:
+                button_label = "Перейти"
+
+    # Prepare reply markup if button present
+    reply_kb = None
+    if button_url:
+        # Ensure URL has scheme
+        if not re.match(r'^https?://', button_url, flags=re.IGNORECASE):
+            button_url = 'https://' + button_url
+        if not button_label:
+            button_label = "🔗 Перейти"
+        reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=button_label, url=button_url)]
+        ])
+
+    # Prepare final message (if empty after stripping, put a placeholder)
+    if not news_text:
+        news_text = "📣 Новость"
+
+    # Broadcast
     recipients = user_settings.get_all_user_ids()
     if not recipients:
         await message.reply("Нет подписчиков для рассылки.")
         return
+
     sent = 0
     failed = 0
     await message.reply(f"Начинаю рассылку новостей ({len(recipients)} пользователей)...")
     # Send sequentially with small delay to avoid flood
     for uid in recipients:
         try:
-            await bot.send_message(uid, f"📣 <b>Новость от бота</b>\n\n{news_text}", parse_mode="HTML")
+            await bot.send_message(uid, f"📣 <b>Новость от бота</b>\n\n{news_text}", parse_mode="HTML", reply_markup=reply_kb, disable_web_page_preview=True)
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -2352,3 +2408,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
