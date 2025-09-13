@@ -5,6 +5,7 @@
 # ===========================================
 from __future__ import annotations
 import os
+from typing import Optional
 import re
 import json
 import asyncio
@@ -17,7 +18,7 @@ import uuid
 import instaloader
 from datetime import datetime, timedelta
 from functools import partial
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Optional, List, Tuple, Any, Optional
 from urllib.parse import urlparse, urlunparse
 import requests
 from dotenv import load_dotenv
@@ -491,7 +492,7 @@ class GroupFilter(BaseFilter):
                 # Удаляем / и возможное упоминание бота
                 command = command_parts[0][1:].split("@")[0]
                 # Список поддерживаемых команд
-                supported_commands = ["start", "help", "cookies", "history", "setup"]
+                supported_commands = ["start", "help", "cookies", "history", "setup", "addnews"]
                 if command in supported_commands:
                     logger.debug(f"Найдена поддерживаемая команда в группе от {message.from_user.id}: /{command}")
                     return True
@@ -571,6 +572,21 @@ class UserSettings:
             return False
         finally:
             conn.close()
+
+    def get_all_user_ids(self) -> list:
+        """Возвращает список всех user_id из таблицы user_settings"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT user_id FROM user_settings")
+            rows = cursor.fetchall()
+            return [r[0] for r in rows]
+        except Exception as e:
+            logger.error(f"Error fetching all user ids: {e}")
+            return []
+        finally:
+            conn.close()
+
 
 # Инициализация менеджера настроек
 user_settings = UserSettings()
@@ -701,7 +717,7 @@ class DownloadManager:
                             message_id=status_msg.message_id,
                             text="📥 Скачиваю видео с Instagram..."
                         )
-                        filepath = await asyncio.to_thread(download_instagram_video, url, tempdir, mode)
+                        filepath = await asyncio.to_thread(download_instagram_video, url, tempdir, mode, user_id)
                     else:
                         # Используем yt-dlp для всех остальных платформ
                         func = partial(ytdl_download, url, tempdir, mode, progress_hook, user_id)
@@ -1488,74 +1504,209 @@ def normalize_reddit_url(url: str) -> Optional[str]:
 
 import instaloader
 
-def download_instagram_video(url: str, out_dir: str, mode: str = "video") -> str:
-    """
-    Скачивает видео или аудио с Instagram с помощью instaloader.
-    Гарантированно работает с Reels, Stories и постами.
-    """
-    # Создаем экземпляр Instaloader
-    L = instaloader.Instaloader(
-        download_videos=True,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        compress_json=False
-    )
 
-    # Извлекаем shortcode из URL
+def _load_cookies_for_requests(cookie_path: str) -> dict:
+    """Parse Netscape-format cookies.txt into a dict suitable for requests.Session().cookies.set"""
+    cookies = {}
+    try:
+        with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    # domain, flag, path, secure, expiration, name, value
+                    name = parts[5]
+                    value = parts[6]
+                    cookies[name] = value
+    except Exception:
+        pass
+    return cookies
+
+def download_instagram_video(url: str, out_dir: str, mode: str = "video", user_id: Optional[int] = None) -> str:
+    """
+    Improved Instagram downloader:
+    - Uses user's cookies (if uploaded) to access private content
+    - Tries multiple fallbacks: og:video, JSON-LD, window._sharedData, instaloader.Post
+    - Returns path to downloaded file
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    session = requests.Session()
+    session.headers.update(headers)
+
+    # If user provided cookies for authenticated access, load them
+    if user_id and user_id in USER_COOKIES:
+        try:
+            cookie_path = USER_COOKIES[user_id]
+            cookie_dict = _load_cookies_for_requests(cookie_path)
+            for k, v in cookie_dict.items():
+                session.cookies.set(k, v)
+        except Exception:
+            pass
+
+    # normalize shortcode
     shortcode = None
-    if "/reel/" in url:
-        shortcode = url.split("/reel/")[1].split("/")[0]
-    elif "/p/" in url:
-        shortcode = url.split("/p/")[1].split("/")[0]
-    elif "/tv/" in url:
-        shortcode = url.split("/tv/")[1].split("/")[0]
+    try:
+        if "/reel/" in url:
+            shortcode = url.split("/reel/")[1].split("/")[0]
+        elif "/p/" in url:
+            shortcode = url.split("/p/")[1].split("/")[0]
+        elif "/tv/" in url:
+            shortcode = url.split("/tv/")[1].split("/")[0]
+        elif "/stories/" in url:
+            # stories URL often contains username and story id; use the last segment as id if present
+            parts = url.strip("/").split("/")
+            if len(parts) >= 3:
+                shortcode = parts[-1]
+    except Exception:
+        shortcode = None
 
-    if not shortcode:
-        raise Exception("Не удалось извлечь shortcode из URL")
-
-    # Скачиваем пост
-    post = instaloader.Post.from_shortcode(L.context, shortcode)
-    
-    # Генерируем имя файла
-    filename = f"instagram_{shortcode}"
-    if mode == "audio":
-        filename += ".mp3"
-    else:
-        filename += ".mp4"
-
+    tempname = f"instagram_{shortcode or uuid.uuid4().hex}"
+    filename = f"{tempname}.mp4" if mode != "audio" else f"{tempname}.mp3"
     filepath = os.path.join(out_dir, filename)
 
-    # Скачиваем видео
-    if post.is_video:
-        video_url = post.video_url
-        if not video_url:
-            raise Exception("Видео не найдено в посте")
-        
-        # Скачиваем файл
-        with requests.get(video_url, stream=True, timeout=300) as r:
-            r.raise_for_status()
-            with open(filepath, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-    else:
-        raise Exception("Это не видео")
-
-    # Если нужен только аудио — конвертируем
-    if mode == "audio":
+    # Helper to try download from direct video url
+    def _download_from_video_url(video_url: str) -> bool:
         try:
-            import subprocess
-            audio_filepath = filepath.replace(".mp4", ".mp3")
-            subprocess.run([
-                "ffmpeg", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_filepath
-            ], check=True, capture_output=True)
-            # Удаляем оригинальный видеофайл
-            os.remove(filepath)
-            filepath = audio_filepath
-        except Exception as e:
-            logger.warning(f"Не удалось извлечь аудио: {e}. Оставляем видео.")
+            if not video_url:
+                return False
+            with session.get(video_url, stream=True, timeout=300) as r:
+                r.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            return True
+        except Exception:
+            return False
 
-    return filepath
+    # 1) Try fetching page HTML and parsing meta tags / JSON-LD
+    try:
+        r = session.get(url, timeout=15)
+        if r.status_code == 200:
+            html = r.text
+            # meta og:video
+            m = re.search(r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+            if not m:
+                m = re.search(r'<meta[^>]+property=["\']og:video:secure_url["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+            if m:
+                vurl = m.group(1)
+                if _download_from_video_url(vurl):
+                    # convert to mp3 if requested
+                    if mode == "audio":
+                        try:
+                            import subprocess
+                            audio_fp = filepath.replace(".mp4", ".mp3")
+                            subprocess.run(["ffmpeg", "-y", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_fp], check=True, capture_output=True)
+                            os.remove(filepath)
+                            filepath = audio_fp
+                        except Exception:
+                            pass
+                    return filepath
+
+            # 2) JSON-LD contentUrl
+            ld = extract_jsonld(html)
+            if isinstance(ld, dict):
+                cu = ld.get("contentUrl") or ld.get("url")
+                if cu and _download_from_video_url(cu):
+                    if mode == "audio":
+                        try:
+                            import subprocess
+                            audio_fp = filepath.replace(".mp4", ".mp3")
+                            subprocess.run(["ffmpeg", "-y", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_fp], check=True, capture_output=True)
+                            os.remove(filepath)
+                            filepath = audio_fp
+                        except Exception:
+                            pass
+                    return filepath
+
+            # 3) window._sharedData or other JSON blobs with video_url or display_resources
+            m = re.search(r'window\._sharedData\s*=\s*({.*?});', html, re.DOTALL)
+            if m:
+                try:
+                    data = json.loads(m.group(1))
+                    # try common paths
+                    entry = data.get("entry_data", {})
+                    for k in ("PostPage", "ReelPage", "ProfilePage"):
+                        if k in entry:
+                            items = entry[k]
+                            if items and isinstance(items, list):
+                                for it in items:
+                                    # drill for video_url or display_resources
+                                    video_url = None
+                                    for candidate in ("video_url", "videoUrl", "display_url"):
+                                        video_url = it.get("graphql", {}).get("shortcode_media", {}).get(candidate) if isinstance(it, dict) else None
+                                        if video_url:
+                                            if _download_from_video_url(video_url):
+                                                if mode == "audio":
+                                                    try:
+                                                        import subprocess
+                                                        audio_fp = filepath.replace(".mp4", ".mp3")
+                                                        subprocess.run(["ffmpeg", "-y", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_fp], check=True, capture_output=True)
+                                                        os.remove(filepath)
+                                                        filepath = audio_fp
+                                                    except Exception:
+                                                        pass
+                                                return filepath
+                except Exception:
+                    pass
+
+            # 4) fallback: search for video_url in HTML
+            m = re.search(r'\"video_url\"\s*:\s*\"([^\"]+)\"', html)
+            if m:
+                v = m.group(1).encode("utf-8").decode("unicode_escape")
+                if _download_from_video_url(v):
+                    if mode == "audio":
+                        try:
+                            import subprocess
+                            audio_fp = filepath.replace(".mp4", ".mp3")
+                            subprocess.run(["ffmpeg", "-y", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_fp], check=True, capture_output=True)
+                            os.remove(filepath)
+                            filepath = audio_fp
+                        except Exception:
+                            pass
+                    return filepath
+    except Exception:
+        pass
+
+    # 5) Last resort: try instaloader (may fail for private content unless cookies/session provided)
+    try:
+        L = instaloader.Instaloader(download_videos=True, download_geotags=False, download_comments=False, save_metadata=False, compress_json=False)
+        # If user cookies available, attempt to set sessionid if present
+        try:
+            if user_id and user_id in USER_COOKIES:
+                cookie_path = USER_COOKIES[user_id]
+                cookie_dict = _load_cookies_for_requests(cookie_path)
+                # If sessionid present, add to Instaloader context cookies
+                if "sessionid" in cookie_dict:
+                    L.context._session.cookies.set("sessionid", cookie_dict["sessionid"])
+        except Exception:
+            pass
+
+        if shortcode:
+            post = instaloader.Post.from_shortcode(L.context, shortcode)
+            if post.is_video:
+                video_url = getattr(post, "video_url", None)
+                if video_url and _download_from_video_url(video_url):
+                    if mode == "audio":
+                        try:
+                            import subprocess
+                            audio_fp = filepath.replace(".mp4", ".mp3")
+                            subprocess.run(["ffmpeg", "-y", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_fp], check=True, capture_output=True)
+                            os.remove(filepath)
+                            filepath = audio_fp
+                        except Exception:
+                            pass
+                    return filepath
+    except Exception:
+        pass
+
+    # If we reach here — failed to download
+    raise Exception("Не удалось получить видео с Instagram. Возможно, это приватный контент или URL изменился.")
 
 def is_youtube_video(url: str) -> bool:
     return bool(YOUTUBE_VIDEO_RE.search(url or ""))
@@ -1761,6 +1912,41 @@ async def cmd_cookies(message: types.Message):
         "Файл должен быть в формате Netscape HTTP Cookie File."
     )
 
+
+
+async def cmd_addnews(message: types.Message):
+    """Admin-only command: /addnews <text>
+    Sends the provided text to all known users (from user_settings table).
+    """
+    ADMIN_ID = 6143311340
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.reply("❌ Только администратор может использовать эту команду.")
+        return
+    text = (message.text or "").strip()
+    # support usage: /addnews <text>
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        await message.reply("Использование: /addnews Текст новости.\nПример: /addnews Бота обновлен! Новые функции: ...")
+        return
+    news_text = parts[1].strip()
+    # Get all users from settings DB
+    recipients = user_settings.get_all_user_ids()
+    if not recipients:
+        await message.reply("Нет подписчиков для рассылки.")
+        return
+    sent = 0
+    failed = 0
+    await message.reply(f"Начинаю рассылку новостей ({len(recipients)} пользователей)...")
+    # Send sequentially with small delay to avoid flood
+    for uid in recipients:
+        try:
+            await bot.send_message(uid, f"📣 <b>Новость от бота</b>\n\n{news_text}", parse_mode="HTML")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    await message.reply(f"Рассылка завершена. Отправлено: {sent}, Не удалось: {failed}")
 def is_valid_netscape_cookie_file(file_path: str) -> bool:
     """Проверяет, является ли файл корректным Netscape HTTP Cookie File"""
     try:
@@ -2151,6 +2337,7 @@ async def main():
     dp.message.register(handle_text, F.text, group_filter)
 
     # Колбэки работают всегда (после того, как пользователь начал взаимодействие)
+    dp.message.register(cmd_addnews, Command(commands=["addnews"]), group_filter)
     dp.callback_query.register(cb_download, F.data.startswith("dl:"))
     dp.callback_query.register(cb_history, F.data.startswith("history:"))
     dp.callback_query.register(cb_retry, F.data.startswith("retry:"))
@@ -2165,4 +2352,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
