@@ -1931,6 +1931,9 @@ async def cmd_addnews(message: types.Message):
     # Try to get args after command. If empty, and this is a reply, take replied message text.
     raw = (message.text or "").strip()
     parts = raw.split(None, 1)
+    # Remove command mention if present (e.g., /addnews@Bot)
+    if parts:
+        parts[0] = re.sub(r'@\w+$', '', parts[0])
     news_text = ""
     if len(parts) >= 2 and parts[1].strip():
         news_text = parts[1].strip()
@@ -2064,6 +2067,9 @@ def has_enough_disk_space(path: str, required_mb: int = 500) -> bool:
         return True  # На случай ошибки, не блокируем загрузку
 
 async def handle_text(message: types.Message):
+    # Ignore bot commands (they are handled by command handlers)
+    if message.text and message.text.strip().startswith('/'):
+        return
     text = (message.text or "").strip()
     url = find_first_url(text)
     # Ignore admin command /addnews so it won't be treated as a download request
