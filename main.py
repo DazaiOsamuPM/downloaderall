@@ -458,19 +458,31 @@ class UserSettings:
         conn.close()
 
     def get_settings(self, user_id):
-        """Получает настройки пользователя с учетом дефолтов"""
+        """Получает настройки пользователя, создает запись если не существует"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT settings FROM user_settings WHERE user_id = ?", (user_id,))
         result = cursor.fetchone()
-        conn.close()
+        
         if result:
             try:
                 user_settings = json.loads(result[0])
-                # Объединяем с дефолтными настройками
+                conn.close()
                 return {**self.DEFAULT_SETTINGS, **user_settings}
             except Exception as e:
                 logger.error(f"Error parsing user settings: {e}")
+        else:
+            # Создаем новую запись с настройками по умолчанию
+            try:
+                cursor.execute(
+                    "INSERT INTO user_settings (user_id, settings) VALUES (?, ?)",
+                    (user_id, json.dumps(self.DEFAULT_SETTINGS))
+                )
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Error creating user settings: {e}")
+            finally:
+                conn.close()
         return self.DEFAULT_SETTINGS.copy()
 
     def update_setting(self, user_id, key, value):
@@ -1776,6 +1788,9 @@ def make_progress_hook(loop: asyncio.AbstractEventLoop, chat_id: int, status_mes
 
 # ---- handlers ----
 async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    # Убедимся, что пользователь добавлен в базу
+    settings = user_settings.get_settings(user_id)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="Скачать видео", callback_data="start_download")
@@ -1801,6 +1816,9 @@ def has_enough_disk_space(path: str, required_mb: int = 500) -> bool:
         return True  # На случай ошибки, не блокируем загрузку
 
 async def handle_text(message: types.Message):
+    user_id = message.from_user.id
+    # Добавляем пользователя в базу при первом взаимодействии
+    user_settings.get_settings(user_id)
     text = (message.text or "").strip()
     url = find_first_url(text)
     # Если ссылка не найдена, но это личный чат - сообщаем об ошибке
