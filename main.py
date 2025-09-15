@@ -344,20 +344,22 @@ class ErrorManager:
         if lang is None or lang not in self.error_messages:
             lang = self.default_lang
         error_data = self.error_messages.get(lang, {}).get(error_type)
-        if not error_data
+        if not error_data:
             # Если для данного языка нет сообщения, используем русский
             error_data = self.error_messages["ru"].get(error_type)
-        if not error_data
+        if not error_data:
             return "⚠️ Произошла неизвестная ошибка. Пожалуйста, попробуйте позже."
+
         # Формируем сообщение
         message = f"<b>{error_data['title']}</b>\n"
         message += f"{error_data['description']}\n"
         for detail in error_data.get("details", []):
             message += f"{detail}\n"
-        if "example" in error_
+        if "example" in error_data:
             message += f"\n<i>Пример:</i>\n<code>{error_data['example']}</code>"
-        if "additional" in error_
+        if "additional" in error_data:
             message += f"\nℹ️ {error_data['additional']}"
+
         # Добавляем кнопку для повторной попытки для некоторых типов ошибок
         if error_type in [DownloadErrorType.NETWORK_ERROR, DownloadErrorType.RATE_LIMITED, DownloadErrorType.URL_NOT_FOUND]:
             message += "\n🔄 Чтобы попробовать снова, нажмите кнопку ниже"
