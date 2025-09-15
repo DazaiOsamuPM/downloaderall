@@ -24,6 +24,7 @@ import shutil
 import time
 import sqlite3
 import uuid
+import subprocess
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Dict, Optional, List, Tuple, Any
@@ -38,6 +39,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile
+from aiohttp import web
 
 # ---- config ----
 load_dotenv()
@@ -1448,13 +1450,13 @@ def normalize_reddit_url(url: str) -> Optional[str]:
         logger.exception("normalize_reddit_url error for %s", url)
     return None
 
-def download_instagram_video(url: str, out_dir: str, mode: str = "video") -> str:
+def download_instagram_video(url: str, out_dir: str, mode: str = "video", quality: str = "best") -> str:
     """
     Скачивает видео или аудио с Instagram без использования yt-dlp.
     Работает для публичных постов без cookies.
     """
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate",
         "Accept": "*/*",
@@ -1470,143 +1472,171 @@ def download_instagram_video(url: str, out_dir: str, mode: str = "video") -> str
         "TE": "trailers",
     }
 
-    # Получаем HTML страницы
     session = requests.Session()
+    session.headers.update(headers)
     
-    for attempt in range(3):  # Попробуем 3 раза
+    for attempt in range(3):
         try:
-            r = session.get(url, headers=headers, timeout=30)
-            if r.status_code != 200:
-                raise Exception(f"Не удалось загрузить страницу Instagram: {r.status_code}")
+            # Получаем HTML страницы
+            response = session.get(url, timeout=30)
+            if response.status_code != 200:
+                raise Exception(f"Не удалось загрузить страницу Instagram: {response.status_code}")
 
-            # Ищем JSON с данными поста (новый метод)
-            # Instagram часто меняет структуру, поэтому пробуем несколько вариантов
-            data = None
+            html_content = response.text
             
-            # Вариант 1: Поиск через window.__additionalDataLoaded
-            match = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);', r.text, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group(1))
-                except Exception:
-                    pass
-
-            # Вариант 2: Поиск через script с типом application/json
-            if not data:
-                match = re.search(r'<script type="application/json" data-s="[^"]*" data-p="[^"]*" data-b="[^"]*">(.+?)</script>', r.text, re.DOTALL)
-                if match:
+            # Ищем JSON данные в различных возможных местах
+            json_data = None
+            json_patterns = [
+                r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);',
+                r'<script type="application/json"[^>]*>(.+?)</script>',
+                r'window\.__initialDataLoaded\([^,]+,\s*({.+?})\);',
+                r'window\.__sharedData\s*=\s*({.+?});',
+                r'window\._sharedData\s*=\s*({.+?});',
+                r'data-blade-instance="([^"]+)"',
+            ]
+            
+            for pattern in json_patterns:
+                matches = re.findall(pattern, html_content, re.DOTALL)
+                for match in matches:
                     try:
-                        data = json.loads(match.group(1))
-                    except Exception:
+                        if isinstance(match, tuple):
+                            match = match[0]
+                        json_data = json.loads(match)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+                if json_data:
+                    break
+
+            if not json_data:
+                # Попробуем извлечь данные из нового формата GraphQL
+                graphql_match = re.search(r'window\.__graphql__\s*=\s*({.+?});', html_content, re.DOTALL)
+                if graphql_match:
+                    try:
+                        json_data = json.loads(graphql_match.group(1))
+                    except json.JSONDecodeError:
                         pass
 
-            # Вариант 3: Поиск через window.__initialDataLoaded
-            if not data:
-                match = re.search(r'window\.__initialDataLoaded\([^,]+,\s*({.+?})\);', r.text, re.DOTALL)
-                if match:
-                    try:
-                        data = json.loads(match.group(1))
-                    except Exception:
-                        pass
-
-            # Вариант 4: Поиск через sharedData
-            if not data:
-                match = re.search(r'window\.__sharedData\s*=\s*({.+?});', r.text, re.DOTALL)
-                if match:
-                    try:
-                        data = json.loads(match.group(1))
-                    except Exception:
-                        pass
-
-            if not data:
+            if not json_data:
                 raise Exception("Не удалось найти данные поста на странице Instagram")
 
-            # Навигация по структуре данных
-            post_data = {}
-            
-            # Попытка найти данные поста
-            if isinstance(data, dict):
-                # Для Reels и новых постов
-                if "require" in data and len(data["require"]) > 0:
-                    require_data = data["require"][0]
-                    if len(require_data) > 3 and isinstance(require_data[3], list) and len(require_data[3]) > 0:
-                        bbox = require_data[3][0].get("__bbox", {}).get("result", {})
-                        if "data" in bbox:
-                            post_data = bbox["data"]
+            # Функция для поиска в глубину в структуре JSON
+            def find_video_url(data, depth=0):
+                if depth > 10:  # Ограничиваем глубину рекурсии
+                    return None
                 
-                # Для старых постов
-                if not post_data and "entry_data" in data and "PostPage" in data["entry_data"] and len(data["entry_data"]["PostPage"]) > 0:
-                    post_data = data["entry_data"]["PostPage"][0].get("graphql", {}).get("shortcode_media", {})
+                if isinstance(data, dict):
+                    # Проверяем возможные ключи с видео URL
+                    for key in ['video_url', 'videoUrl', 'contentUrl', 'url', 'src', 'video_versions']:
+                        if key in data:
+                            value = data[key]
+                            if isinstance(value, str) and value.startswith('http') and any(ext in value for ext in ['.mp4', '.mov', '.avi']):
+                                return value
+                            elif isinstance(value, list) and key == 'video_versions':
+                                # Выбираем лучшее качество
+                                best_quality = None
+                                for version in value:
+                                    if isinstance(version, dict) and 'url' in version:
+                                        if quality == "best":
+                                            if not best_quality or version.get('width', 0) > best_quality.get('width', 0):
+                                                best_quality = version
+                                        else:
+                                            target_height = int(quality.replace('p', ''))
+                                            if version.get('height') == target_height:
+                                                return version['url']
+                                if best_quality:
+                                    return best_quality['url']
+                    
+                    # Рекурсивно ищем в значениях
+                    for value in data.values():
+                        result = find_video_url(value, depth + 1)
+                        if result:
+                            return result
                 
-                # Альтернативный путь для Reels
-                if not post_data and "props" in data and "pageProps" in data["props"] and "data" in data["props"]["pageProps"]:
-                    post_data = data["props"]["pageProps"]["data"].get("shortcode_media", {})
+                elif isinstance(data, list):
+                    for item in data:
+                        result = find_video_url(item, depth + 1)
+                        if result:
+                            return result
                 
-                # Еще один путь для Reels
-                if not post_data and "graphql" in data and "shortcode_media" in data["graphql"]:
-                    post_data = data["graphql"]["shortcode_media"]
+                return None
 
-            # Ищем видео
-            video_url = None
+            # Ищем видео URL
+            video_url = find_video_url(json_data)
             
-            # Для Reels
-            if "shortcode_media" in post_data:
-                media = post_data["shortcode_media"]
-                if media.get("__typename") == "GraphVideo" or media.get("is_video"):
-                    video_url = media.get("video_url") or media.get("hd_url") or media.get("video_versions", [{}])[0].get("url")
-            elif post_data.get("__typename") == "GraphVideo" or post_data.get("is_video"):
-                video_url = post_data.get("video_url") or post_data.get("hd_url") or post_data.get("video_versions", [{}])[0].get("url")
-            # Для каруселей (несколько видео)
-            elif post_data.get("__typename") == "GraphSidecar":
-                edges = post_data.get("edge_sidecar_to_children", {}).get("edges", [])
-                if edges:
-                    for edge in edges:
-                        node = edge.get("node", {})
-                        if node.get("__typename") == "GraphVideo":
-                            video_url = node.get("video_url")
-                            break
-
             if not video_url:
-                raise Exception("Видео не найдено в посте Instagram")
+                # Альтернативный метод: поиск через Open Graph
+                og_video_match = re.search(r'<meta[^>]+property="og:video"[^>]+content="([^"]+)"', html_content)
+                if og_video_match:
+                    video_url = og_video_match.group(1)
+                else:
+                    raise Exception("Видео не найдено в посте Instagram")
 
             # Генерируем имя файла
-            filename = f"instagram_{int(time.time())}"
-            if mode == "audio":
-                filename += ".mp3"
-            else:
-                filename += ".mp4"
+            timestamp = int(time.time())
+            filename = f"instagram_{timestamp}"
+            filepath = os.path.join(out_dir, filename + (".mp3" if mode == "audio" else ".mp4"))
 
-            filepath = os.path.join(out_dir, filename)
-
-            # Скачиваем видео
-            with requests.get(video_url, headers=headers, stream=True, timeout=300) as r:
-                r.raise_for_status()
-                with open(filepath, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
+            # Скачиваем видео с прогресс-баром
+            video_response = session.get(video_url, stream=True, timeout=300)
+            video_response.raise_for_status()
+            
+            total_size = int(video_response.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(filepath, 'wb') as f:
+                for chunk in video_response.iter_content(chunk_size=8192):
+                    if chunk:
                         f.write(chunk)
+                        downloaded += len(chunk)
+                        # Логирование прогресса каждые 5%
+                        if total_size > 0:
+                            percent = (downloaded / total_size) * 100
+                            if percent % 5 < 0.1:
+                                logger.info(f"Скачано {downloaded}/{total_size} байт ({percent:.1f}%)")
 
             # Если нужен только аудио — конвертируем
             if mode == "audio":
                 try:
-                    import subprocess
                     audio_filepath = filepath.replace(".mp4", ".mp3")
+                    # Используем ffmpeg для извлечения аудио
                     subprocess.run([
-                        "ffmpeg", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_filepath
-                    ], check=True, capture_output=True)
+                        "ffmpeg", "-i", filepath, 
+                        "-vn", "-acodec", "libmp3lame", 
+                        "-q:a", "2", "-y", audio_filepath
+                    ], check=True, capture_output=True, timeout=300)
+                    
                     # Удаляем оригинальный видеофайл
                     os.remove(filepath)
                     filepath = audio_filepath
+                    
+                except subprocess.TimeoutExpired:
+                    logger.warning("Конвертация аудио заняла слишком много времени")
+                    raise Exception("Таймаут конвертации аудио")
                 except Exception as e:
-                    logger.warning(f"Не удалось извлечь аудио: {e}. Оставляем видео.")
+                    logger.warning(f"Не удалось извлечь аудио: {e}")
+                    # Если не удалось конвертировать, возвращаем видео
+                    if not os.path.exists(filepath):
+                        raise
 
             return filepath
 
-        except Exception as e:
-            if attempt < 2:  # Если это не последняя попытка
-                time.sleep(2)  # Ждем 2 секунды перед повторной попыткой
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Сетевая ошибка (попытка {attempt + 1}/3): {e}")
+            if attempt < 2:
+                time.sleep(3)
                 continue
             else:
-                raise e  # Если все попытки неудачны, выбрасываем исключение
+                raise
+        except Exception as e:
+            logger.error(f"Ошибка при обработке (попытка {attempt + 1}/3): {e}")
+            if attempt < 2:
+                time.sleep(3)
+                continue
+            else:
+                raise
+
+    raise Exception("Не удалось скачать видео после 3 попыток")
 
 def is_youtube_video(url: str) -> bool:
     return bool(YOUTUBE_VIDEO_RE.search(url or ""))
@@ -1791,19 +1821,72 @@ async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     # Убедимся, что пользователь добавлен в базу
     settings = user_settings.get_settings(user_id)
+    
+    # Создаем интерактивную клавиатуру с основными действиями
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Скачать видео", callback_data="start_download")
+            InlineKeyboardButton(text="🎬 Скачать видео", callback_data="start_download"),
+            InlineKeyboardButton(text="🎵 Скачать аудио", callback_data="format:audio")
         ],
         [
             InlineKeyboardButton(text="📜 История загрузок", callback_data="history:view")
+        ],
+        [
+            InlineKeyboardButton(text="👥 Добавить в группу", url="https://t.me/Lain_ExBot?startgroup=true")
         ]
     ])
-    await message.reply(
-        "Привет! 👋\n"
-        "Я могу скачать для тебя видео или аудио с YouTube, TikTok, Instagram, Facebook, Twitter/X, VK, Reddit, Pinterest, Dailymotion, Vimeo, SoundCloud и прямых ссылок.\n"
-        "👤 Автор: @frastiel",
-        reply_markup=keyboard
+    
+    # Формируем информативное приветственное сообщение
+    welcome_text = (
+        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+        "🎉 <b>Добро пожаловать в мое логово скачивании видео!</b>\n\n"
+        "📥 <b>Я могу скачать для тебя:</b>\n"
+        "• Видео с YouTube, TikTok, Instagram, Facebook, Twitter/X\n"
+        "• Контент с VK, Reddit, Pinterest, Dailymotion\n"
+        "• Видео с Vimeo, SoundCloud и прямых ссылок\n"
+        "• Аудио в формате MP3 из любого видео\n\n"
+        "🚀 <b>Как использовать:</b>\n"
+        "1. Просто отправь мне ссылку на видео\n"
+        "2. Выбери формат (видео/аудио)\n"
+        "3. Получи готовый файл!\n\n"
+        "👤 <b>Автор:</b> @frastiel\n"
+        "📢 <b>Новости:</b> @ExLainInfo\n\n"
+        "💎 <i>Нажми на кнопки ниже чтобы начать!</i>"
+    )
+    
+    try:
+        # Пытаемся отправить сообщение с фото
+        await bot.send_photo(
+            chat_id=message.chat.id,
+            photo="https://2chan.gt.tc/629e2f97fc046da3b7de90adae06c394.jpg",
+            caption=welcome_text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    except Exception:
+        # Если не удалось отправить с фото, отправляем текстовое сообщение
+        await message.reply(
+            welcome_text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    
+    # Отправляем дополнительное сообщение с примерами
+    examples_text = (
+        "🌐 <b>Примеры поддерживаемых ссылок:</b>\n"
+        "• <code>https://www.youtube.com/watch?v=...</code>\n"
+        "• <code>https://vm.tiktok.com/...</code>\n"
+        "• <code>https://www.instagram.com/reel/...</code>\n"
+        "• <code>https://x.com/user/status/...</code>\n"
+        "• <code>https://vk.com/video-...</code>\n\n"
+        "📝 <i>Просто скопируй и отправь мне любую ссылку!</i>"
+    )
+    
+    await message.answer(
+        examples_text,
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
 
 def has_enough_disk_space(path: str, required_mb: int = 500) -> bool:
@@ -1981,8 +2064,10 @@ async def cmd_addnews(message: types.Message):
     Usage examples:
     /addnews Текст новости
     /addnews button=Label|https://example.com Текст новости
+    /addnews button1=Label1|URL1,button2=Label2|URL2 Текст новости
     /addnews https://example.com Текст новости (will create a button from first URL)
     You can also reply to a message with /addnews to forward that message as news.
+    Supports media files (photo, video, document) when replying to media messages.
     """
     ADMIN_ID = 6143311340  # Замените на ваш ID администратора
     user_id = message.from_user.id
@@ -1997,62 +2082,96 @@ async def cmd_addnews(message: types.Message):
     if parts:
         parts[0] = re.sub(r'@\w+$', '', parts[0])
     news_text = ""
-    if len(parts) >= 2 and parts[1].strip():
+    buttons = []
+    
+    # Check if we're replying to a message with media
+    replied_message = message.reply_to_message
+    media_file = None
+    media_type = None
+    
+    if replied_message:
+        # Get media from replied message if available
+        if replied_message.photo:
+            media_file = replied_message.photo[-1].file_id
+            media_type = "photo"
+        elif replied_message.video:
+            media_file = replied_message.video.file_id
+            media_type = "video"
+        elif replied_message.document:
+            media_file = replied_message.document.file_id
+            media_type = "document"
+        elif replied_message.audio:
+            media_file = replied_message.audio.file_id
+            media_type = "audio"
+        
+        # Use caption if available, otherwise use text
+        if replied_message.caption:
+            news_text = replied_message.caption
+        elif replied_message.text:
+            news_text = replied_message.text
+    
+    # If not replying or no text from reply, use command arguments
+    if not news_text and len(parts) >= 2 and parts[1].strip():
         news_text = parts[1].strip()
-    elif message.reply_to_message and (message.reply_to_message.text or message.reply_to_message.caption):
-        # Use the replied-to message text or caption
-        news_text = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
-    else:
+    
+    if not news_text and not media_file:
         await message.reply(
             "Использование: /addnews Текст новости.\n"
             "Пример: /addnews Бота обновлен! Новые функции: ...\n"
-            "Дополнительно можно добавить кнопку: /addnews button=Label|https://example.com Текст"
+            "Дополнительно можно добавить кнопки: /addnews button1=Label1|URL1,button2=Label2|URL2 Текст\n"
+            "Или ответьте на сообщение с медиа-файлом, чтобы отправить его в рассылке."
         )
         return
 
-    # Detect explicit button token: button=Label|URL or button=URL
-    button_url = None
-    button_label = None
-    mbtn = re.search(r'button\s*[:=]\s*([^\s]+)', news_text, flags=re.IGNORECASE)
-    if mbtn:
-        btn_part = mbtn.group(1).strip()
-        if '|' in btn_part:
-            # button=Label|URL
-            button_label, button_url = btn_part.split('|', 1)
+    # Parse buttons from text (multiple buttons supported: button1=Label1|URL1,button2=Label2|URL2)
+    button_pattern = r'(?:^|,)\s*button(?:\d+)?\s*[:=]\s*([^,]+)'
+    button_matches = re.findall(button_pattern, news_text, re.IGNORECASE)
+    
+    for btn_match in button_matches:
+        btn_match = btn_match.strip()
+        if '|' in btn_match:
+            button_label, button_url = btn_match.split('|', 1)
             button_label = button_label.strip()
             button_url = button_url.strip()
-        else:
-            # button=URL
-            button_url = btn_part.strip()
-            button_label = "Перейти"
-        # Remove the button token from news_text
-        news_text = news_text.replace(mbtn.group(0), '').strip()
-
-    # If no explicit button, try to extract first URL from news_text
-    if not button_url:
+            
+            # Ensure URL has scheme
+            if not re.match(r'^https?://', button_url, flags=re.IGNORECASE):
+                button_url = 'https://' + button_url
+            
+            buttons.append(InlineKeyboardButton(text=button_label, url=button_url))
+        
+        # Remove button patterns from news text
+        news_text = re.sub(button_pattern, '', news_text, flags=re.IGNORECASE)
+    
+    # If no explicit buttons, try to extract first URL from news_text to create a default button
+    if not buttons:
         murl = re.search(r'https?://[^\s<>"()]+', news_text, flags=re.IGNORECASE)
         if murl:
             button_url = murl.group(0)
-            button_label = "🔗 Перейти"
-            # Optionally remove URL from text? Or leave it.
-            # news_text = news_text.replace(button_url, '').strip()
-
-    # Prepare reply markup if button present
+            buttons.append(InlineKeyboardButton(text="🔗 Перейти", url=button_url))
+    
+    # Clean up news text (remove extra commas and whitespace)
+    news_text = re.sub(r'^\s*,\s*|\s*,\s*$', '', news_text)  # Remove leading/trailing commas
+    news_text = re.sub(r'\s*,\s*', ', ', news_text)  # Normalize commas
+    news_text = news_text.strip()
+    
+    # Prepare reply markup if buttons present
     reply_kb = None
-    if button_url:
-        # Ensure URL has scheme
-        if not re.match(r'^https?://', button_url, flags=re.IGNORECASE):
-            button_url = 'https://' + button_url
-        if not button_label:
-            button_label = "🔗 Перейти"
-        reply_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=button_label, url=button_url)]
-        ])
-
+    if buttons:
+        # Split buttons into rows of 2 buttons each
+        button_rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+        reply_kb = InlineKeyboardMarkup(inline_keyboard=button_rows)
+    
     # Prepare final message (if empty after stripping, put a placeholder)
-    if not news_text:
+    if not news_text and not media_file:
         news_text = "📣 Новость"
-
+    
+    # Add news header if we have text
+    if news_text:
+        formatted_text = f"📣 <b>Новость от бота</b>\n\n{news_text}"
+    else:
+        formatted_text = "📣 <b>Новость от бота</b>"
+    
     # Broadcast
     recipients = user_settings.get_all_user_ids()
     if not recipients:
@@ -2061,25 +2180,78 @@ async def cmd_addnews(message: types.Message):
 
     sent = 0
     failed = 0
-    await message.reply(f"Начинаю рассылку новостей ({len(recipients)} пользователей)...")
-
+    total = len(recipients)
+    progress_msg = await message.reply(f"📤 Начинаю рассылку новостей (0/{total})...")
+    
     # Send sequentially with small delay to avoid flood
-    for uid in recipients:
+    for i, uid in enumerate(recipients):
         try:
-            await bot.send_message(
-                uid,
-                f"📣 <b>Новость от бота</b>\n\n{news_text}",
-                parse_mode="HTML",
-                reply_markup=reply_kb,
-                disable_web_page_preview=True
-            )
+            if media_file:
+                # Send media with caption
+                if media_type == "photo":
+                    await bot.send_photo(
+                        uid,
+                        photo=media_file,
+                        caption=formatted_text,
+                        parse_mode="HTML",
+                        reply_markup=reply_kb
+                    )
+                elif media_type == "video":
+                    await bot.send_video(
+                        uid,
+                        video=media_file,
+                        caption=formatted_text,
+                        parse_mode="HTML",
+                        reply_markup=reply_kb
+                    )
+                elif media_type == "document":
+                    await bot.send_document(
+                        uid,
+                        document=media_file,
+                        caption=formatted_text,
+                        parse_mode="HTML",
+                        reply_markup=reply_kb
+                    )
+                elif media_type == "audio":
+                    await bot.send_audio(
+                        uid,
+                        audio=media_file,
+                        caption=formatted_text,
+                        parse_mode="HTML",
+                        reply_markup=reply_kb
+                    )
+            else:
+                # Send text message
+                await bot.send_message(
+                    uid,
+                    formatted_text,
+                    parse_mode="HTML",
+                    reply_markup=reply_kb,
+                    disable_web_page_preview=True
+                )
+            
             sent += 1
-            await asyncio.sleep(0.05)  # Задержка между отправкой сообщений
+            
+            # Update progress every 10 messages or every 5 seconds
+            if i % 10 == 0 or i == total - 1:
+                try:
+                    await progress_msg.edit_text(f"📤 Рассылка новостей: {i+1}/{total} отправлено")
+                except:
+                    pass
+            
+            await asyncio.sleep(0.1)  # Задержка между отправкой сообщений
         except Exception as e:
             logger.error(f"Не удалось отправить сообщение пользователю {uid}: {e}")
             failed += 1
-
-    await message.reply(f"Рассылка завершена. Отправлено: {sent}, Не удалось: {failed}")
+    
+    # Send final report
+    report_text = f"✅ Рассылка завершена\n\nОтправлено: {sent}\nНе удалось: {failed}"
+    
+    if failed > 0:
+        report_text += "\n\n❌ Некоторые сообщения не были доставлены. Это может быть связано с тем, что пользователи заблокировали бота или удалили свои аккаунты."
+    
+    await progress_msg.edit_text(report_text)
+    await message.reply(report_text)
 
 # Обработчик для управления загрузкой (пауза/отмена)
 async def cb_progress_control(callback: types.CallbackQuery):
@@ -2162,8 +2334,6 @@ async def cb_retry(callback: types.CallbackQuery):
         del RETRY_LINKS[retry_id]
 
 # ===== ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK =====
-from aiohttp import web
-
 async def health_check(request):
     """Endpoint для проверки работоспособности сервиса"""
     return web.json_response({"status": "ok", "bot": "running"})
