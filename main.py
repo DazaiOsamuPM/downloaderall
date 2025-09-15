@@ -571,7 +571,7 @@ class DownloadManager:
                     self.queue.task_done()
 
     async def _handle_download(self, callback_query: types.CallbackQuery, url: str, mode: str, user_id: int, task_id: int):
-        """Обработка отдельной загрузки"""
+        """Обработка отдельной загрузки (исправленная версия)"""
         try:
             # Проверяем кэш перед началом загрузки
             cached_file = cache_manager.get_cached_file(url, mode)
@@ -587,8 +587,13 @@ class DownloadManager:
             )
 
             # Обновляем информацию о загрузке
+            ACTIVE_DOWNLOADS.setdefault(task_id, {})
             ACTIVE_DOWNLOADS[task_id]["status"] = "downloading"
             ACTIVE_DOWNLOADS[task_id]["status_msg_id"] = status_msg.message_id
+            ACTIVE_DOWNLOADS[task_id]["url"] = url
+            ACTIVE_DOWNLOADS[task_id]["mode"] = mode
+            ACTIVE_DOWNLOADS[task_id]["user_id"] = user_id
+            ACTIVE_DOWNLOADS[task_id]["start_time"] = time.time()
 
             loop = asyncio.get_running_loop()
             progress_hook = make_progress_hook(loop, target_chat_id, status_msg.message_id, task_id)
@@ -597,7 +602,15 @@ class DownloadManager:
 
             # Проверяем свободное место на диске
             if not has_enough_disk_space(tempdir, required_mb=500):
-                await callback_query.message.answer("⚠️ На сервере недостаточно места для загрузки. Попробуйте позже.")
+                try:
+                    await bot.edit_message_text(
+                        chat_id=target_chat_id,
+                        message_id=status_msg.message_id,
+                        text="⚠️ На сервере недостаточно места для загрузки. Попробуйте позже."
+                    )
+                except Exception:
+                    # fallback
+                    await callback_query.message.answer("⚠️ На сервере недостаточно места для загрузки. Попробуйте позже.")
                 return
 
             # Проверяем, не слишком ли большой файл (ограничение 1 ГБ)
@@ -610,59 +623,88 @@ class DownloadManager:
                             chat_id=target_chat_id,
                             message_id=status_msg.message_id,
                             text=f"❌ Файл слишком большой ({content_length/(1024*1024):.1f} MB). "
-                                 f"Максимальный размер: 1 ГБ."
+                                f"Максимальный размер: 1 ГБ."
                         )
+                        ACTIVE_DOWNLOADS[task_id]["status"] = "failed"
                         return
             except Exception as e:
                 logger.warning(f"Не удалось определить размер файла: {e}")
 
-            # Если это прямая ссылка на файл, используем упрощенную загрузку
-            if DIRECT_FILE_RE.search(url):
-                try:
-                    await bot.edit_message_text(
-                        chat_id=target_chat_id,
-                        message_id=status_msg.message_id,
-                        text="📥 Обнаружена прямая ссылка на файл. Начинаю загрузку..."
-                    )
+            # Выполняем скачивание (единую логику для direct / instagram / yt-dlp)
+            try:
+                if DIRECT_FILE_RE.search(url):
+                    # прямая ссылка на файл
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=target_chat_id,
+                            message_id=status_msg.message_id,
+                            text="📥 Обнаружена прямая ссылка на файл. Начинаю загрузку..."
+                        )
+                    except Exception:
+                        pass
+                    # _download_direct_file у вас определён как async
                     filepath = await self._download_direct_file(url, tempdir)
-                except Exception as e:
-                    await self._handle_download_error(callback_query, e, url, status_msg.message_id)
-                    return
-            else:
-                try:
-                    # Специальная обработка для Instagram
-                    if "instagram.com" in url.lower():
+                elif "instagram.com" in url.lower():
+                    try:
                         await bot.edit_message_text(
                             chat_id=target_chat_id,
                             message_id=status_msg.message_id,
                             text="📥 Скачиваю видео с Instagram..."
                         )
-                        filepath = await asyncio.to_thread(download_instagram_video, url, tempdir, mode)
-                    else:
-                        # Используем yt-dlp для всех остальных платформ
-                        func = partial(ytdl_download, url, tempdir, mode, progress_hook)
-                        filepath = await asyncio.wait_for(loop.run_in_executor(None, func), timeout=420)
+                    except Exception:
+                        pass
+                    # скачиваем в потоковом исполнении, т.к. download_instagram_video блокирующая
+                    filepath = await asyncio.to_thread(download_instagram_video, url, tempdir, mode)
+                else:
+                    # Используем yt-dlp для всех остальных платформ (с прогресс-хуком)
+                    func = partial(ytdl_download, url, tempdir, mode, progress_hook)
+                    filepath = await asyncio.wait_for(loop.run_in_executor(None, func), timeout=420)
 
-                    # Сохраняем в кэш
+                # Проверяем, что файл получен
+                if not filepath or not os.path.exists(filepath):
+                    raise FileNotFoundError("Файл не найден после загрузки.")
+
+                # Обновляем запись о задаче
+                ACTIVE_DOWNLOADS[task_id]["filepath"] = filepath
+                ACTIVE_DOWNLOADS[task_id]["status"] = "saving"
+
+                # Сохраняем в кэш (не критично — если упадёт, просто логируем)
+                try:
                     cache_manager.add_to_cache(url, filepath, mode)
-                    # Добавляем в историю
-                    history_manager.add_to_history(user_id, url, mode)
-                    # Отправляем файл
-                    await self._send_file(callback_query, url, filepath, mode, status_msg.message_id)
                 except Exception as e:
-                    await self._handle_download_error(callback_query, e, url, status_msg.message_id)
+                    logger.warning(f"Не удалось добавить в кэш: {e}")
+
+                # Добавляем в историю (не критично)
+                try:
+                    history_manager.add_to_history(user_id, url, mode)
+                except Exception as e:
+                    logger.warning(f"Не удалось добавить в историю: {e}")
+
+                # Отправляем файл пользователю
+                await self._send_file(callback_query, url, filepath, mode, status_msg.message_id)
+                ACTIVE_DOWNLOADS[task_id]["status"] = "done"
+                ACTIVE_DOWNLOADS[task_id]["end_time"] = time.time()
+
+            except Exception as e:
+                ACTIVE_DOWNLOADS[task_id]["status"] = "failed"
+                logger.exception("Ошибка при скачивании/обработке файла")
+                await self._handle_download_error(callback_query, e, url, status_msg.message_id)
+
             finally:
+                # Чистим временную директорию
                 try:
                     if tempdir and os.path.isdir(tempdir):
                         shutil.rmtree(tempdir)
                 except Exception:
                     pass
+
         except Exception as e:
-            logger.exception("Ошибка при обработке загрузки")
+            logger.exception("Ошибка при обработке загрузки (внешняя)")
             try:
                 await callback_query.message.answer(f"Произошла ошибка: {str(e)}")
-            except:
+            except Exception:
                 pass
+
         finally:
             # Удаляем задачу из активных
             async with self.lock:
@@ -671,10 +713,13 @@ class DownloadManager:
                         self.active_tasks[user_id].remove(task_id)
                     if not self.active_tasks[user_id]:
                         del self.active_tasks[user_id]
-                self.processing -= 1
+                # Защита от отрицательных значений
+                if self.processing > 0:
+                    self.processing -= 1
                 # Удаляем информацию о загрузке
                 if task_id in ACTIVE_DOWNLOADS:
                     del ACTIVE_DOWNLOADS[task_id]
+
 
     async def _download_direct_file(self, url: str, tempdir: str) -> str:
         """Скачивание прямой ссылки на файл"""
