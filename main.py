@@ -1764,6 +1764,7 @@ async def upload_to_multiple_services(filepath: str) -> Optional[str]:
 def ytdl_download(url: str, out_dir: str, mode: str, progress_hook=None) -> str:
     """
     Прямая загрузка через yt-dlp. Поддерживает прогресс-хук.
+    Возвращает путь к реальному файлу на диске.
     """
     opts = YTDL_BASE_OPTS.copy()
     opts["outtmpl"] = os.path.join(out_dir, "%(id)s.%(ext)s")
@@ -1775,6 +1776,9 @@ def ytdl_download(url: str, out_dir: str, mode: str, progress_hook=None) -> str:
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             }],
+            "postprocessor_args": {
+                "ffmpeg": ["-q:a", "2"]
+            }
         })
     else:
         opts.update({
@@ -1783,20 +1787,47 @@ def ytdl_download(url: str, out_dir: str, mode: str, progress_hook=None) -> str:
         })
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
+
     with YoutubeDL(opts) as ytdl:
         info = ytdl.extract_info(url, download=True)
+
+        # === КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: получаем путь к файлу из самого yt-dlp ===
+        # После postprocessing (например, конвертации в mp3) yt-dlp обновляет 'filepath'
+        filepath = info.get("_filename")  # это путь до обработки
+        if not filepath:
+            # Если _filename нет — используем outtmpl + подставляем данные
+            filepath = ytdl.prepare_filename(info)
+
+        # Но! После postprocessing файл может иметь другое расширение (например, .mp3)
+        # Поэтому проверяем: если режим "audio", ищем .mp3
         if mode == "audio":
-            filename = os.path.join(out_dir, f"{info.get('id')}.mp3")
-            if not os.path.exists(filename):
-                filename = ytdl.prepare_filename(info)
-                filename = os.path.splitext(filename)[0] + ".mp3"
+            # yt-dlp при конвертации в mp3 меняет расширение, но имя без расширения то же
+            base = os.path.splitext(filepath)[0]
+            mp3_path = base + ".mp3"
+            if os.path.exists(mp3_path):
+                return mp3_path
+            # fallback: если не нашли — пробуем оригинальный путь
+            if os.path.exists(filepath):
+                return filepath
+            # крайний fallback: ищем любой .mp3 в папке с тем же id
+            id_part = info.get("id")
+            if id_part:
+                for f in os.listdir(out_dir):
+                    if f.startswith(id_part) and f.endswith(".mp3"):
+                        return os.path.join(out_dir, f)
         else:
-            filename = ytdl.prepare_filename(info)
-            if not filename.lower().endswith(".mp4"):
-                filename = os.path.splitext(filename)[0] + ".mp4"
-        if not os.path.exists(filename):
-            raise FileNotFoundError(f"Не найден файл: {filename}")
-        return filename
+            # Для видео — проверяем .mp4 или оригинальный файл
+            if filepath.endswith(".mp4") and os.path.exists(filepath):
+                return filepath
+            base = os.path.splitext(filepath)[0]
+            mp4_path = base + ".mp4"
+            if os.path.exists(mp4_path):
+                return mp4_path
+            if os.path.exists(filepath):
+                return filepath
+
+        # Если ничего не нашли — ошибка
+        raise FileNotFoundError(f"Файл не найден после загрузки. Ожидался: {filepath}")
 
 def make_progress_hook(loop: asyncio.AbstractEventLoop, chat_id: int, status_message_id: int, task_id: int):
     """
