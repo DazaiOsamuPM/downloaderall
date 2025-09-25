@@ -25,6 +25,7 @@ import time
 import sqlite3
 import uuid
 import subprocess
+import aiohttp
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Dict, Optional, List, Tuple, Any
@@ -668,7 +669,8 @@ class DownloadManager:
                     except Exception:
                         pass
                     # скачиваем в потоковом исполнении, т.к. download_instagram_video блокирующая
-                    filepath = await asyncio.to_thread(download_instagram_video, url, tempdir, mode)
+                    async with aiohttp.ClientSession() as session:
+                        filepath = await download_instagram_video_async(url, tempdir, mode, session=session)
                 else:
                     # Используем yt-dlp для всех остальных платформ (с прогресс-хуком)
                     func = partial(ytdl_download, url, tempdir, mode, progress_hook)
@@ -836,14 +838,19 @@ class DownloadManager:
                 await bot.edit_message_text(
                     chat_id=target_chat_id,
                     message_id=status_msg_id,
-                    text=f"Файл большой ({size_mb:.1f} MB). Попробую загрузить на transfer.sh..."
+                    text=f"Файл большой ({size_mb:.1f} MB). Загружаю на облачный сервис..."
                 )
-                link = await asyncio.to_thread(upload_to_transfersh, filepath)
+                link = await upload_to_multiple_services(filepath)
                 if link:
                     await bot.edit_message_text(
                         chat_id=target_chat_id,
                         message_id=status_msg_id,
-                        text=f"Файл превышает лимит Telegram ({size_mb:.1f} MB).\nСсылка: {link}\n📌 Источник: {source}\n🔗 Оригинальная ссылка: {url}",
+                        text=(
+                            f"Файл превышает лимит Telegram ({size_mb:.1f} MB).\n"
+                            f"Ссылка: {link}\n"
+                            f"📌 Источник: {source}\n"
+                            f"🔗 Оригинальная ссылка: {url}"
+                        ),
                         reply_markup=retry_kb,
                         disable_web_page_preview=True
                     )
@@ -851,7 +858,12 @@ class DownloadManager:
                     await bot.edit_message_text(
                         chat_id=target_chat_id,
                         message_id=status_msg_id,
-                        text=f"Не удалось загрузить на transfer.sh. Попробуйте скачать локально.\n📌 Источник: {source}\n🔗 Оригинальная ссылка: {url}",
+                        text=(
+                            f"Не удалось загрузить файл ни на один сервис.\n"
+                            f"Попробуйте позже или используйте другой источник.\n"
+                            f"📌 Источник: {source}\n"
+                            f"🔗 Оригинальная ссылка: {url}"
+                        ),
                         reply_markup=retry_kb,
                         disable_web_page_preview=True
                     )
@@ -876,7 +888,11 @@ class DownloadManager:
                 await bot.edit_message_text(
                     chat_id=target_chat_id,
                     message_id=status_msg_id,
-                    text=f"✅ Готово — отправлено ({size_mb:.1f} MB).\n📌 Источник: {source}\n🔗 Оригинальная ссылка: {url}",
+                    text=(
+                        f"✅ Готово — отправлено ({size_mb:.1f} MB).\n"
+                        f"📌 Источник: {source}\n"
+                        f"🔗 Оригинальная ссылка: {url}"
+                    ),
                     reply_markup=retry_kb,
                     disable_web_page_preview=True
                 )
@@ -1336,47 +1352,60 @@ def extract_tiktok_video_from_html(html: str) -> Optional[str]:
         return f"https://www.tiktok.com/@{user}/video/{vid}"
     return None
 
-def normalize_tiktok_url_blocking(url: str) -> Optional[str]:
+async def normalize_tiktok_url_async(url: str, session: aiohttp.ClientSession) -> Optional[str]:
     """
-    Блокирующая функция нормализации. Вызываем её через asyncio.to_thread(...)
-    чтобы не блокировать event loop.
+    Асинхронная нормализация TikTok URL без блокировок.
     """
     try:
         url_low = url.lower()
-        # Если короткая/редирект или vm.tiktok.com — распутаем
+        headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"}
+
+        # Если это короткая ссылка — разрешаем редирект
         if any(d in url_low for d in SHORTENER_DOMAINS):
-            final = resolve_redirects(url)
-            final_clean = strip_tracking_params(final)
-            if "/video/" in final_clean or "vm.tiktok.com" in final_clean:
-                return final_clean
             try:
-                r = requests.get(final, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
-                if r.status_code == 200:
-                    ex = extract_tiktok_video_from_html(r.text)
+                async with session.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10), headers=headers) as resp:
+                    final = str(resp.url)
+            except Exception:
+                async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=12), headers=headers) as resp:
+                    final = str(resp.url)
+            final_clean = strip_tracking_params(final)
+            if "/video/" in final_clean:
+                return final_clean
+
+            # Пытаемся распарсить HTML
+            async with session.get(final, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    ex = extract_tiktok_video_from_html(html)
                     if ex:
                         return ex
-            except Exception:
-                pass
-        # Уже на /video/
+
+        # Уже /video/ — просто чистим
         if "/video/" in url_low:
             return strip_tracking_params(url)
-        # Профиль/хэштег/музыка/поиск — пытаемся вытащить видео со страницы
+
+        # Профиль/хэштег — парсим HTML
         if any(p in url_low for p in ("/@", "/tag/", "/hashtag/", "/music/", "/explore", "/search")):
-            try:
-                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
-                if r.status_code == 200:
-                    ex = extract_tiktok_video_from_html(r.text)
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    ex = extract_tiktok_video_from_html(html)
                     if ex:
                         return ex
-            except Exception:
-                pass
+
         # Последняя попытка
-        final = resolve_redirects(url)
+        try:
+            async with session.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10), headers=headers) as resp:
+                final = str(resp.url)
+        except Exception:
+            async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10), headers=headers) as resp:
+                final = str(resp.url)
         final_clean = strip_tracking_params(final)
         if "/video/" in final_clean:
             return final_clean
+
     except Exception:
-        logger.exception("normalize_tiktok_url error for %s", url)
+        logger.exception("normalize_tiktok_url_async error for %s", url)
     return None
 
 def normalize_twitter_url(url: str) -> Optional[str]:
@@ -1450,193 +1479,153 @@ def normalize_reddit_url(url: str) -> Optional[str]:
         logger.exception("normalize_reddit_url error for %s", url)
     return None
 
-def download_instagram_video(url: str, out_dir: str, mode: str = "video", quality: str = "best") -> str:
+async def download_instagram_video_async(url: str, out_dir: str, mode: str = "video", quality: str = "best", session: aiohttp.ClientSession = None) -> str:
     """
-    Скачивает видео или аудио с Instagram без использования yt-dlp.
-    Работает для публичных постов без cookies.
+    Асинхронная загрузка видео с Instagram.
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-        "Accept": "*/*",
-        "Referer": "https://www.instagram.com/",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-IG-App-ID": "936619743392459",
-        "X-ASBD-ID": "129477",
-        "X-IG-WWW-Claim": "0",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "TE": "trailers",
-    }
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession(
+            headers={
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.instagram.com/",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-IG-App-ID": "936619743392459",
+            }
+        )
+        close_session = True
 
-    session = requests.Session()
-    session.headers.update(headers)
-    
-    for attempt in range(3):
-        try:
-            # Получаем HTML страницы
-            response = session.get(url, timeout=30)
-            if response.status_code != 200:
-                raise Exception(f"Не удалось загрузить страницу Instagram: {response.status_code}")
+    try:
+        for attempt in range(3):
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"Не удалось загрузить страницу Instagram: {resp.status}")
+                    html_content = await resp.text()
 
-            html_content = response.text
-            
-            # Ищем JSON данные в различных возможных местах
-            json_data = None
-            json_patterns = [
-                r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);',
-                r'<script type="application/json"[^>]*>(.+?)</script>',
-                r'window\.__initialDataLoaded\([^,]+,\s*({.+?})\);',
-                r'window\.__sharedData\s*=\s*({.+?});',
-                r'window\._sharedData\s*=\s*({.+?});',
-                r'data-blade-instance="([^"]+)"',
-            ]
-            
-            for pattern in json_patterns:
-                matches = re.findall(pattern, html_content, re.DOTALL)
-                for match in matches:
-                    try:
-                        if isinstance(match, tuple):
-                            match = match[0]
-                        json_data = json.loads(match)
+                # Ищем JSON (те же паттерны)
+                json_data = None
+                json_patterns = [
+                    r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);',
+                    r'<script type="application/json"[^>]*>(.+?)</script>',
+                    r'window\.__initialDataLoaded\([^,]+,\s*({.+?})\);',
+                    r'window\.__sharedData\s*=\s*({.+?});',
+                    r'window\._sharedData\s*=\s*({.+?});',
+                    r'window\.__graphql__\s*=\s*({.+?});',
+                ]
+                for pattern in json_patterns:
+                    matches = re.findall(pattern, html_content, re.DOTALL)
+                    for match in matches:
+                        try:
+                            if isinstance(match, tuple):
+                                match = match[0]
+                            json_data = json.loads(match)
+                            break
+                        except json.JSONDecodeError:
+                            continue
+                    if json_data:
                         break
-                    except json.JSONDecodeError:
-                        continue
-                if json_data:
-                    break
 
-            if not json_data:
-                # Попробуем извлечь данные из нового формата GraphQL
-                graphql_match = re.search(r'window\.__graphql__\s*=\s*({.+?});', html_content, re.DOTALL)
-                if graphql_match:
-                    try:
-                        json_data = json.loads(graphql_match.group(1))
-                    except json.JSONDecodeError:
-                        pass
+                if not json_data:
+                    raise Exception("Не удалось найти данные поста")
 
-            if not json_data:
-                raise Exception("Не удалось найти данные поста на странице Instagram")
-
-            # Функция для поиска в глубину в структуре JSON
-            def find_video_url(data, depth=0):
-                if depth > 10:  # Ограничиваем глубину рекурсии
+                def find_video_url(data, depth=0):
+                    if depth > 10:
+                        return None
+                    if isinstance(data, dict):
+                        for key in ['video_url', 'videoUrl', 'contentUrl', 'url', 'src', 'video_versions']:
+                            if key in data:
+                                value = data[key]
+                                if isinstance(value, str) and value.startswith('http') and any(ext in value for ext in ['.mp4', '.mov']):
+                                    return value
+                                elif isinstance(value, list) and key == 'video_versions':
+                                    best = None
+                                    for v in value:
+                                        if isinstance(v, dict) and 'url' in v:
+                                            if quality == "best":
+                                                if not best or v.get('width', 0) > best.get('width', 0):
+                                                    best = v
+                                            else:
+                                                target_h = int(quality.replace('p', ''))
+                                                if v.get('height') == target_h:
+                                                    return v['url']
+                                    if best:
+                                        return best['url']
+                        for v in data.values():
+                            res = find_video_url(v, depth + 1)
+                            if res:
+                                return res
+                    elif isinstance(data, list):
+                        for item in data:
+                            res = find_video_url(item, depth + 1)
+                            if res:
+                                return res
                     return None
-                
-                if isinstance(data, dict):
-                    # Проверяем возможные ключи с видео URL
-                    for key in ['video_url', 'videoUrl', 'contentUrl', 'url', 'src', 'video_versions']:
-                        if key in data:
-                            value = data[key]
-                            if isinstance(value, str) and value.startswith('http') and any(ext in value for ext in ['.mp4', '.mov', '.avi']):
-                                return value
-                            elif isinstance(value, list) and key == 'video_versions':
-                                # Выбираем лучшее качество
-                                best_quality = None
-                                for version in value:
-                                    if isinstance(version, dict) and 'url' in version:
-                                        if quality == "best":
-                                            if not best_quality or version.get('width', 0) > best_quality.get('width', 0):
-                                                best_quality = version
-                                        else:
-                                            target_height = int(quality.replace('p', ''))
-                                            if version.get('height') == target_height:
-                                                return version['url']
-                                if best_quality:
-                                    return best_quality['url']
-                    
-                    # Рекурсивно ищем в значениях
-                    for value in data.values():
-                        result = find_video_url(value, depth + 1)
-                        if result:
-                            return result
-                
-                elif isinstance(data, list):
-                    for item in data:
-                        result = find_video_url(item, depth + 1)
-                        if result:
-                            return result
-                
-                return None
 
-            # Ищем видео URL
-            video_url = find_video_url(json_data)
-            
-            if not video_url:
-                # Альтернативный метод: поиск через Open Graph
-                og_video_match = re.search(r'<meta[^>]+property="og:video"[^>]+content="([^"]+)"', html_content)
-                if og_video_match:
-                    video_url = og_video_match.group(1)
+                video_url = find_video_url(json_data)
+                if not video_url:
+                    og_match = re.search(r'<meta[^>]+property="og:video"[^>]+content="([^"]+)"', html_content)
+                    if og_match:
+                        video_url = og_match.group(1)
+                    else:
+                        raise Exception("Видео не найдено")
+
+                timestamp = int(time.time())
+                filename = f"instagram_{timestamp}"
+                filepath = os.path.join(out_dir, filename + (".mp3" if mode == "audio" else ".mp4"))
+
+                # Скачиваем видео асинхронно
+                async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                    resp.raise_for_status()
+                    total_size = int(resp.headers.get('content-length', 0))
+                    downloaded = 0
+                    with open(filepath, 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size > 0 and downloaded % (total_size // 20) == 0:
+                                percent = downloaded / total_size * 100
+                                logger.info(f"Instagram: скачано {percent:.1f}%")
+
+                # Конвертация в аудио (если нужно) — остаётся синхронной (ffmpeg не имеет async-обёртки)
+                if mode == "audio":
+                    audio_path = filepath.replace(".mp4", ".mp3")
+                    try:
+                        await asyncio.create_subprocess_exec(
+                            "ffmpeg", "-i", filepath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y", audio_path,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL
+                        )
+                        os.remove(filepath)
+                        filepath = audio_path
+                    except Exception as e:
+                        logger.warning(f"Не удалось конвертировать аудио: {e}")
+                        if not os.path.exists(filepath):
+                            raise
+
+                return filepath
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"Сетевая ошибка Instagram (попытка {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    await asyncio.sleep(3)
+                    continue
                 else:
-                    raise Exception("Видео не найдено в посте Instagram")
+                    raise
+            except Exception as e:
+                logger.error(f"Ошибка Instagram (попытка {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    await asyncio.sleep(3)
+                    continue
+                else:
+                    raise
 
-            # Генерируем имя файла
-            timestamp = int(time.time())
-            filename = f"instagram_{timestamp}"
-            filepath = os.path.join(out_dir, filename + (".mp3" if mode == "audio" else ".mp4"))
+    finally:
+        if close_session:
+            await session.close()
 
-            # Скачиваем видео с прогресс-баром
-            video_response = session.get(video_url, stream=True, timeout=300)
-            video_response.raise_for_status()
-            
-            total_size = int(video_response.headers.get('content-length', 0))
-            downloaded = 0
-            
-            with open(filepath, 'wb') as f:
-                for chunk in video_response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        # Логирование прогресса каждые 5%
-                        if total_size > 0:
-                            percent = (downloaded / total_size) * 100
-                            if percent % 5 < 0.1:
-                                logger.info(f"Скачано {downloaded}/{total_size} байт ({percent:.1f}%)")
-
-            # Если нужен только аудио — конвертируем
-            if mode == "audio":
-                try:
-                    audio_filepath = filepath.replace(".mp4", ".mp3")
-                    # Используем ffmpeg для извлечения аудио
-                    subprocess.run([
-                        "ffmpeg", "-i", filepath, 
-                        "-vn", "-acodec", "libmp3lame", 
-                        "-q:a", "2", "-y", audio_filepath
-                    ], check=True, capture_output=True, timeout=300)
-                    
-                    # Удаляем оригинальный видеофайл
-                    os.remove(filepath)
-                    filepath = audio_filepath
-                    
-                except subprocess.TimeoutExpired:
-                    logger.warning("Конвертация аудио заняла слишком много времени")
-                    raise Exception("Таймаут конвертации аудио")
-                except Exception as e:
-                    logger.warning(f"Не удалось извлечь аудио: {e}")
-                    # Если не удалось конвертировать, возвращаем видео
-                    if not os.path.exists(filepath):
-                        raise
-
-            return filepath
-
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Сетевая ошибка (попытка {attempt + 1}/3): {e}")
-            if attempt < 2:
-                time.sleep(3)
-                continue
-            else:
-                raise
-        except Exception as e:
-            logger.error(f"Ошибка при обработке (попытка {attempt + 1}/3): {e}")
-            if attempt < 2:
-                time.sleep(3)
-                continue
-            else:
-                raise
-
-    raise Exception("Не удалось скачать видео после 3 попыток")
+    raise Exception("Не удалось скачать Instagram после 3 попыток")
 
 def is_youtube_video(url: str) -> bool:
     return bool(YOUTUBE_VIDEO_RE.search(url or ""))
@@ -1691,6 +1680,84 @@ def upload_to_transfersh(path: str) -> Optional[str]:
                 return r.text.strip()
     except Exception:
         logger.exception("transfer.sh upload failed")
+    return None
+
+async def upload_to_fileio(session: aiohttp.ClientSession, filepath: str) -> Optional[str]:
+    """Загружает файл на file.io (время жизни по умолчанию — 14 дней)"""
+    url = "https://file.io/?expires=14d"
+    try:
+        with open(filepath, "rb") as f:
+            data = aiohttp.FormData()
+            data.add_field('file', f, filename=os.path.basename(filepath))
+            async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status == 200:
+                    json_resp = await resp.json()
+                    if json_resp.get("success"):
+                        return json_resp.get("link")
+    except Exception as e:
+        logger.warning(f"file.io upload failed: {e}")
+    return None
+
+async def upload_to_anonfiles(session: aiohttp.ClientSession, filepath: str) -> Optional[str]:
+    """Загружает файл на anonfiles.com"""
+    url = "https://api.anonfiles.com/upload"
+    try:
+        with open(filepath, "rb") as f:
+            data = aiohttp.FormData()
+            data.add_field('file', f, filename=os.path.basename(filepath))
+            async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status == 200:
+                    json_resp = await resp.json()
+                    if json_resp.get("status"):
+                        return json_resp["data"]["file"]["url"]["short"]
+    except Exception as e:
+        logger.warning(f"anonfiles.com upload failed: {e}")
+    return None
+
+async def upload_to_gofile(session: aiohttp.ClientSession, filepath: str) -> Optional[str]:
+    """Загружает файл на gofile.io"""
+    try:
+        # Сначала получаем сервер
+        async with session.get("https://api.gofile.io/servers", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return None
+            server_data = await resp.json()
+            if not server_data.get("status") == "ok":
+                return None
+            server = server_data["data"]["servers"][0]["name"]
+        # Загружаем файл
+        upload_url = f"https://{server}.gofile.io/contents/uploadfile"
+        with open(filepath, "rb") as f:
+            data = aiohttp.FormData()
+            data.add_field('file', f, filename=os.path.basename(filepath))
+            async with session.post(upload_url, data=data, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status == 200:
+                    json_resp = await resp.json()
+                    if json_resp.get("status") == "ok":
+                        return json_resp["data"]["downloadPage"]
+    except Exception as e:
+        logger.warning(f"gofile.io upload failed: {e}")
+    return None
+
+async def upload_to_multiple_services(filepath: str) -> Optional[str]:
+    """Пытается загрузить файл на несколько сервисов с fallback'ом"""
+    async with aiohttp.ClientSession() as session:
+        # Порядок приоритета: transfer.sh → file.io → anonfiles → gofile
+        for uploader in [
+            lambda s: asyncio.to_thread(upload_to_transfersh, filepath),  # остаётся синхронной
+            lambda s: upload_to_fileio(s, filepath),
+            lambda s: upload_to_anonfiles(s, filepath),
+            lambda s: upload_to_gofile(s, filepath)
+        ]:
+            try:
+                link = await uploader(session)
+                if link:
+                    logger.info(f"Файл успешно загружен: {link}")
+                    return link
+            except Exception as e:
+                logger.warning(f"Загрузчик завершился с ошибкой: {e}")
+                continue
+    logger.error("Все сервисы загрузки недоступны")
     return None
 
 # ---- yt-dlp download ----
@@ -1915,7 +1982,8 @@ async def handle_text(message: types.Message):
 
     if any(dom in ulow for dom in ("tiktok.com", "vm.tiktok.com", "m.tiktok.com")):
         try:
-            norm = await asyncio.to_thread(normalize_tiktok_url_blocking, url)
+            async with aiohttp.ClientSession() as session:
+                norm = await normalize_tiktok_url_async(url, session)
             if norm:
                 normalized = norm
         except Exception:
